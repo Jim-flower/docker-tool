@@ -4,9 +4,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+)
+
+type pickerMode int
+
+const (
+	pickerModeFile pickerMode = iota
+	pickerModeDirectory
 )
 
 // FilePicker lets the user navigate and pick .tar files from the filesystem.
@@ -20,13 +28,19 @@ type FilePicker struct {
 	canceled   bool
 	filter     string
 	err        error
+	mode       pickerMode
 }
 
-func NewFilePicker(startDir, filter string, visibleHeight int) FilePicker {
+func NewFilePicker(startDir, filter string, visibleHeight int, mode ...pickerMode) FilePicker {
+	pickMode := pickerModeFile
+	if len(mode) > 0 {
+		pickMode = mode[0]
+	}
 	fp := FilePicker{
 		currentDir: startDir,
 		height:     visibleHeight,
 		filter:     filter,
+		mode:       pickMode,
 	}
 	fp.entries, fp.err = readDir(startDir, filter)
 	return fp
@@ -53,6 +67,10 @@ func (fp FilePicker) Update(msg tea.Msg) (FilePicker, tea.Cmd) {
 				}
 			}
 		case "enter":
+			if fp.mode == pickerModeDirectory {
+				fp.chosen = fp.currentDir
+				break
+			}
 			if len(fp.entries) == 0 {
 				break
 			}
@@ -84,7 +102,11 @@ func (fp FilePicker) Update(msg tea.Msg) (FilePicker, tea.Cmd) {
 func (fp FilePicker) View() string {
 	var sb strings.Builder
 
-	sb.WriteString(styleTitle.Render("Select File"))
+	title := "Select File"
+	if fp.mode == pickerModeDirectory {
+		title = "Select Folder"
+	}
+	sb.WriteString(styleTitle.Render(title))
 	sb.WriteString("\n")
 	sb.WriteString(styleMuted.Render("  " + fp.currentDir))
 	sb.WriteString("\n\n")
@@ -118,7 +140,11 @@ func (fp FilePicker) View() string {
 		}
 	}
 
-	sb.WriteString(styleHelp.Render("\n  ↑/↓ navigate  •  enter open/select  •  ← parent dir  •  esc cancel"))
+	if fp.mode == pickerModeDirectory {
+		sb.WriteString(styleHelp.Render("\n  ↑/↓ navigate  •  enter use this folder  •  ← parent dir  •  esc cancel"))
+	} else {
+		sb.WriteString(styleHelp.Render("\n  ↑/↓ navigate  •  enter open/select  •  ← parent dir  •  esc cancel"))
+	}
 	return sb.String()
 }
 
@@ -137,5 +163,11 @@ func readDir(dir, filter string) ([]os.DirEntry, error) {
 			filtered = append(filtered, e)
 		}
 	}
+	sort.Slice(filtered, func(i, j int) bool {
+		if filtered[i].IsDir() != filtered[j].IsDir() {
+			return filtered[i].IsDir()
+		}
+		return strings.ToLower(filtered[i].Name()) < strings.ToLower(filtered[j].Name())
+	})
 	return filtered, nil
 }

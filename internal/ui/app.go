@@ -26,6 +26,7 @@ const (
 	screenExportDest
 	screenExportProgress
 	screenImportFile
+	screenImportFileList
 	screenImportVolumeName
 	screenResults
 	screenError
@@ -51,8 +52,9 @@ type App struct {
 	menuIdx int
 
 	// data
-	images  []dockerclient.Image
-	volumes []dockerclient.Volume
+	images   []dockerclient.Image
+	volumes  []dockerclient.Volume
+	tarFiles []tarFile
 
 	// sub-models
 	multiSelect MultiSelectModel
@@ -60,14 +62,15 @@ type App struct {
 	inputBuffer string
 
 	// operation state
-	selectedImageIndices  []int
-	selectedVolumeIndices []int
-	importFilePath        string
-	results               []string
-	errMsg                string
-	loadingMsg            string
-	exportProgress        exportProgressState
-	exportProgressCh      <-chan operations.ExportProgress
+	selectedImageIndices   []int
+	selectedVolumeIndices  []int
+	selectedTarFileIndices []int
+	importFilePath         string
+	results                []string
+	errMsg                 string
+	loadingMsg             string
+	exportProgress         exportProgressState
+	exportProgressCh       <-chan operations.ExportProgress
 
 	windowWidth  int
 	windowHeight int
@@ -164,6 +167,8 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case screenImportFile:
 		return a.handleImportFile(msg)
+	case screenImportFileList:
+		return a.handleImportFileList(msg)
 	case screenImportVolumeName:
 		return a.handleImportVolumeName(msg)
 	case screenResults, screenError:
@@ -213,12 +218,12 @@ func (a *App) activateMenuItem() (tea.Model, tea.Cmd) {
 		return a, loadVolumesCmd(a.dc)
 
 	case 3: // Import Images
-		a.filePicker = NewFilePicker(defaultFilePickerDir(), ".tar", listHeight(a.windowHeight))
+		a.filePicker = NewFilePicker(defaultFilePickerDir(), ".tar", listHeight(a.windowHeight), pickerModeDirectory)
 		a.action = actionImportImages
 		a.screen = screenImportFile
 
 	case 4: // Import Volumes
-		a.filePicker = NewFilePicker(defaultFilePickerDir(), ".tar", listHeight(a.windowHeight))
+		a.filePicker = NewFilePicker(defaultFilePickerDir(), ".tar", listHeight(a.windowHeight), pickerModeDirectory)
 		a.action = actionImportVolumes
 		a.screen = screenImportFile
 
@@ -472,28 +477,77 @@ func (a *App) handleImportFile(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if a.filePicker.IsChosen() {
-		a.importFilePath = a.filePicker.Chosen()
-		if a.action == actionImportImages {
-			ctx := context.Background()
-			results := operations.ImportImages(ctx, a.dc, []string{a.importFilePath})
-			var lines []string
-			for _, r := range results {
-				if r.Err != nil {
-					lines = append(lines, styleError.Render("✗ "+r.Name+": "+r.Err.Error()))
-				} else {
-					lines = append(lines, styleSuccess.Render("✔ Loaded: "+r.Name))
-				}
-			}
-			a.results = lines
-			a.screen = screenResults
-		} else {
-			// Need a volume name for import.
-			a.inputBuffer = ""
-			a.screen = screenImportVolumeName
+		dir := a.filePicker.Chosen()
+		files, err := listTarFiles(dir)
+		if err != nil {
+			a.errMsg = "Cannot list import files: " + err.Error()
+			a.screen = screenError
+			return a, nil
 		}
+		a.tarFiles = files
+		items := make([]SelectableItem, len(files))
+		for i, file := range files {
+			items[i] = file
+		}
+		a.multiSelect = NewMultiSelect("Select Tar Files to Import", items, listHeight(a.windowHeight)).SelectAll()
+		a.screen = screenImportFileList
 	}
 
 	return a, cmd
+}
+
+func (a *App) handleImportFileList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	updated, cmd := a.multiSelect.Update(msg)
+	a.multiSelect = updated
+
+	if a.multiSelect.IsCanceled() {
+		a.screen = screenMenu
+		return a, nil
+	}
+
+	if a.multiSelect.IsDone() {
+		indices := a.multiSelect.SelectedIndices()
+		if len(indices) == 0 {
+			a.screen = screenMenu
+			return a, nil
+		}
+		sort.Ints(indices)
+		a.selectedTarFileIndices = indices
+		a.runImport()
+	}
+
+	return a, cmd
+}
+
+func (a *App) runImport() {
+	filePaths := make([]string, len(a.selectedTarFileIndices))
+	volumeNames := make([]string, len(a.selectedTarFileIndices))
+	for i, idx := range a.selectedTarFileIndices {
+		file := a.tarFiles[idx]
+		filePaths[i] = file.Path
+		volumeNames[i] = volumeNameFromTar(file.Name)
+	}
+
+	ctx := context.Background()
+	var results []operations.ImportResult
+	if a.action == actionImportImages {
+		results = operations.ImportImages(ctx, a.dc, filePaths)
+	} else {
+		results = operations.ImportVolumes(ctx, a.dc, filePaths, volumeNames)
+	}
+
+	lines := make([]string, 0, len(results))
+	for _, r := range results {
+		if r.Err != nil {
+			lines = append(lines, styleError.Render("✗ "+r.Name+": "+r.Err.Error()))
+		} else if a.action == actionImportImages {
+			lines = append(lines, styleSuccess.Render("✔ Loaded: "+r.Name))
+		} else {
+			lines = append(lines, styleSuccess.Render("✔ Imported into volume: "+r.Name))
+		}
+	}
+	a.results = lines
+	a.screen = screenResults
 }
 
 // ---- Volume name input for import ----
@@ -594,6 +648,9 @@ func (a *App) View() string {
 	case screenImportFile:
 		sb.WriteString(a.filePicker.View())
 
+	case screenImportFileList:
+		sb.WriteString(a.multiSelect.View())
+
 	case screenImportVolumeName:
 		sb.WriteString(styleTitle.Render("Volume Name for Import") + "\n\n")
 		sb.WriteString(styleMuted.Render("  File: "+a.importFilePath) + "\n\n")
@@ -641,6 +698,17 @@ func (v volumeItem) SubText() string {
 	return fmt.Sprintf("Driver: %s  Size: %s  Ref: %s  Mount: %s", v.vol.Driver, size, refCount, v.vol.Mountpoint)
 }
 
+type tarFile struct {
+	Name string
+	Path string
+	Size int64
+}
+
+func (t tarFile) DisplayName() string { return t.Name }
+func (t tarFile) SubText() string {
+	return fmt.Sprintf("Size: %s  Path: %s", units.HumanSize(float64(t.Size)), t.Path)
+}
+
 func listHeight(windowHeight int) int {
 	if windowHeight > 20 {
 		return windowHeight - 10
@@ -669,6 +737,44 @@ func defaultFilePickerDir() string {
 		return home
 	}
 	return "."
+}
+
+func listTarFiles(dir string) ([]tarFile, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	files := make([]tarFile, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".tar") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, tarFile{
+			Name: entry.Name(),
+			Path: filepath.Join(dir, entry.Name()),
+			Size: info.Size(),
+		})
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		return strings.ToLower(files[i].Name) < strings.ToLower(files[j].Name)
+	})
+
+	return files, nil
+}
+
+func volumeNameFromTar(name string) string {
+	name = strings.TrimSuffix(name, filepath.Ext(name))
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "imported-volume"
+	}
+	return name
 }
 
 func resolvePathInput(input string) (string, error) {
