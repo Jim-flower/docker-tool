@@ -27,6 +27,7 @@ const (
 	screenExportProgress
 	screenImportFile
 	screenImportFileList
+	screenImportProgress
 	screenImportVolumeName
 	screenResults
 	screenError
@@ -71,6 +72,8 @@ type App struct {
 	loadingMsg             string
 	exportProgress         exportProgressState
 	exportProgressCh       <-chan operations.ExportProgress
+	importProgress         importProgressState
+	importProgressCh       <-chan operations.ImportProgress
 
 	windowWidth  int
 	windowHeight int
@@ -102,6 +105,20 @@ type exportProgressMsg struct {
 }
 
 type exportSpinnerTickMsg struct{}
+
+type importProgressState struct {
+	current   string
+	completed int
+	total     int
+	lines     []string
+	spinner   int
+}
+
+type importProgressMsg struct {
+	progress operations.ImportProgress
+}
+
+type importSpinnerTickMsg struct{}
 
 var menuItems = []string{
 	"Export Images",
@@ -140,6 +157,12 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case exportSpinnerTickMsg:
 		return a.handleExportSpinnerTick()
 
+	case importProgressMsg:
+		return a.handleImportProgress(msg)
+
+	case importSpinnerTickMsg:
+		return a.handleImportSpinnerTick()
+
 	case tea.KeyMsg:
 		return a.handleKey(msg)
 	}
@@ -169,6 +192,10 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a.handleImportFile(msg)
 	case screenImportFileList:
 		return a.handleImportFileList(msg)
+	case screenImportProgress:
+		if msg.String() == "ctrl+c" {
+			return a, tea.Quit
+		}
 	case screenImportVolumeName:
 		return a.handleImportVolumeName(msg)
 	case screenResults, screenError:
@@ -513,13 +540,13 @@ func (a *App) handleImportFileList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		sort.Ints(indices)
 		a.selectedTarFileIndices = indices
-		a.runImport()
+		return a.startImport()
 	}
 
 	return a, cmd
 }
 
-func (a *App) runImport() {
+func (a *App) startImport() (tea.Model, tea.Cmd) {
 	filePaths := make([]string, len(a.selectedTarFileIndices))
 	volumeNames := make([]string, len(a.selectedTarFileIndices))
 	for i, idx := range a.selectedTarFileIndices {
@@ -528,26 +555,85 @@ func (a *App) runImport() {
 		volumeNames[i] = volumeNameFromTar(file.DisplayName())
 	}
 
-	ctx := context.Background()
-	var results []operations.ImportResult
+	progressCh := make(chan operations.ImportProgress)
+	a.importProgressCh = progressCh
+	a.importProgress = importProgressState{}
+	a.screen = screenImportProgress
+
 	if a.action == actionImportImages {
-		results = operations.ImportImages(ctx, a.dc, filePaths)
+		go func() {
+			defer close(progressCh)
+			operations.ImportImagesWithProgress(context.Background(), a.dc, filePaths, func(progress operations.ImportProgress) {
+				progressCh <- progress
+			})
+		}()
 	} else {
-		results = operations.ImportVolumes(ctx, a.dc, filePaths, volumeNames)
+		go func() {
+			defer close(progressCh)
+			operations.ImportVolumesWithProgress(context.Background(), a.dc, filePaths, volumeNames, func(progress operations.ImportProgress) {
+				progressCh <- progress
+			})
+		}()
 	}
 
-	lines := make([]string, 0, len(results))
-	for _, r := range results {
-		if r.Err != nil {
-			lines = append(lines, styleError.Render("✗ "+r.Name+": "+r.Err.Error()))
+	return a, tea.Batch(waitImportProgressCmd(progressCh), importSpinnerTickCmd())
+}
+
+func waitImportProgressCmd(progressCh <-chan operations.ImportProgress) tea.Cmd {
+	return func() tea.Msg {
+		progress, ok := <-progressCh
+		if !ok {
+			return importProgressMsg{progress: operations.ImportProgress{Done: true}}
+		}
+		return importProgressMsg{progress: progress}
+	}
+}
+
+func (a *App) handleImportProgress(msg importProgressMsg) (tea.Model, tea.Cmd) {
+	if a.screen != screenImportProgress {
+		return a, nil
+	}
+
+	progress := msg.progress
+	if progress.Total > 0 {
+		a.importProgress.total = progress.Total
+	}
+	if progress.Name != "" {
+		a.importProgress.current = progress.Name
+	}
+	if progress.Index >= 0 {
+		a.importProgress.completed = progress.Index
+	}
+	if progress.HasResult {
+		if progress.Result.Err != nil {
+			a.importProgress.lines = append(a.importProgress.lines, styleError.Render("✗ "+progress.Result.Name+": "+progress.Result.Err.Error()))
 		} else if a.action == actionImportImages {
-			lines = append(lines, styleSuccess.Render("✔ Loaded: "+r.Name))
+			a.importProgress.lines = append(a.importProgress.lines, styleSuccess.Render("✔ Loaded: "+progress.Result.Name))
 		} else {
-			lines = append(lines, styleSuccess.Render("✔ Imported into volume: "+r.Name))
+			a.importProgress.lines = append(a.importProgress.lines, styleSuccess.Render("✔ Imported into volume: "+progress.Result.Name))
 		}
 	}
-	a.results = lines
-	a.screen = screenResults
+	if progress.Done {
+		a.results = a.importProgress.lines
+		a.screen = screenResults
+		return a, nil
+	}
+
+	return a, waitImportProgressCmd(a.importProgressCh)
+}
+
+func importSpinnerTickCmd() tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg {
+		return importSpinnerTickMsg{}
+	})
+}
+
+func (a *App) handleImportSpinnerTick() (tea.Model, tea.Cmd) {
+	if a.screen != screenImportProgress {
+		return a, nil
+	}
+	a.importProgress.spinner++
+	return a, importSpinnerTickCmd()
 }
 
 // ---- Volume name input for import ----
@@ -650,6 +736,30 @@ func (a *App) View() string {
 
 	case screenImportFileList:
 		sb.WriteString(a.multiSelect.View())
+
+	case screenImportProgress:
+		sb.WriteString(styleTitle.Render("Importing") + "\n\n")
+		total := a.importProgress.total
+		completed := a.importProgress.completed
+		if total == 0 {
+			total = 1
+		}
+		sb.WriteString(styleNormal.Render(fmt.Sprintf("  Working %s  %d/%d complete", spinnerFrame(a.importProgress.spinner), completed, total)) + "\n")
+		sb.WriteString("  " + renderProgressBar(completed, total, 30) + "\n")
+		if a.importProgress.current != "" && completed < total {
+			sb.WriteString(styleMuted.Render("  Current: "+a.importProgress.current) + "\n")
+		}
+		if len(a.importProgress.lines) > 0 {
+			sb.WriteString("\n")
+			start := len(a.importProgress.lines) - 6
+			if start < 0 {
+				start = 0
+			}
+			for _, line := range a.importProgress.lines[start:] {
+				sb.WriteString("  " + line + "\n")
+			}
+		}
+		sb.WriteString(styleHelp.Render("\n  Please wait  •  ctrl+c quit"))
 
 	case screenImportVolumeName:
 		sb.WriteString(styleTitle.Render("Volume Name for Import") + "\n\n")

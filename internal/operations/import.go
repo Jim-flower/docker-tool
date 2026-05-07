@@ -19,14 +19,40 @@ type ImportResult struct {
 	Err  error
 }
 
+// ImportProgress reports item-level import progress.
+type ImportProgress struct {
+	Index     int
+	Total     int
+	Name      string
+	Result    ImportResult
+	HasResult bool
+	Done      bool
+}
+
 // ImportImages loads .tar image archives into Docker.
 func ImportImages(ctx context.Context, dc *dockerclient.Client, filePaths []string) []ImportResult {
+	return ImportImagesWithProgress(ctx, dc, filePaths, nil)
+}
+
+// ImportImagesWithProgress loads images and reports progress before and after each file.
+func ImportImagesWithProgress(ctx context.Context, dc *dockerclient.Client, filePaths []string, onProgress func(ImportProgress)) []ImportResult {
 	results := make([]ImportResult, 0, len(filePaths))
 	cli := dc.Raw()
+	total := len(filePaths)
 
-	for _, fp := range filePaths {
+	for i, fp := range filePaths {
+		name := filepath.Base(fp)
+		if onProgress != nil {
+			onProgress(ImportProgress{Index: i, Total: total, Name: name})
+		}
 		result := importSingleImage(ctx, cli, fp)
 		results = append(results, result)
+		if onProgress != nil {
+			onProgress(ImportProgress{Index: i + 1, Total: total, Name: name, Result: result, HasResult: true})
+		}
+	}
+	if onProgress != nil {
+		onProgress(ImportProgress{Index: total, Total: total, Done: true})
 	}
 	return results
 }
@@ -52,13 +78,28 @@ func importSingleImage(ctx context.Context, cli *client.Client, filePath string)
 
 // ImportVolumes restores volume data from .tar archives into named Docker volumes.
 func ImportVolumes(ctx context.Context, dc *dockerclient.Client, filePaths []string, volumeNames []string) []ImportResult {
+	return ImportVolumesWithProgress(ctx, dc, filePaths, volumeNames, nil)
+}
+
+// ImportVolumesWithProgress restores volumes and reports progress before and after each file.
+func ImportVolumesWithProgress(ctx context.Context, dc *dockerclient.Client, filePaths []string, volumeNames []string, onProgress func(ImportProgress)) []ImportResult {
 	results := make([]ImportResult, 0, len(filePaths))
 	cli := dc.Raw()
+	total := len(filePaths)
 
 	for i, fp := range filePaths {
 		volName := volumeNames[i]
+		if onProgress != nil {
+			onProgress(ImportProgress{Index: i, Total: total, Name: volName})
+		}
 		result := importSingleVolume(ctx, cli, fp, volName)
 		results = append(results, result)
+		if onProgress != nil {
+			onProgress(ImportProgress{Index: i + 1, Total: total, Name: volName, Result: result, HasResult: true})
+		}
+	}
+	if onProgress != nil {
+		onProgress(ImportProgress{Index: total, Total: total, Done: true})
 	}
 	return results
 }
