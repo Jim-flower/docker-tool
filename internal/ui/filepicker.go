@@ -68,7 +68,7 @@ func (fp FilePicker) Update(msg tea.Msg) (FilePicker, tea.Cmd) {
 			}
 		case "enter":
 			if fp.mode == pickerModeDirectory {
-				fp.chosen = fp.currentDir
+				fp.chosen = fp.selectedDir()
 				break
 			}
 			if len(fp.entries) == 0 {
@@ -154,7 +154,7 @@ func (fp FilePicker) View() string {
 	}
 
 	if fp.mode == pickerModeDirectory {
-		sb.WriteString(styleHelp.Render("\n  ↑/↓ navigate  •  → open folder  •  ← parent dir  •  enter use this folder  •  esc cancel"))
+		sb.WriteString(styleHelp.Render("\n  ↑/↓ navigate  •  → open folder  •  ← parent dir  •  enter select folder  •  esc cancel"))
 	} else {
 		sb.WriteString(styleHelp.Render("\n  ↑/↓ navigate  •  →/enter open/select  •  ← parent dir  •  esc cancel"))
 	}
@@ -164,6 +164,17 @@ func (fp FilePicker) View() string {
 func (fp FilePicker) IsChosen() bool   { return fp.chosen != "" }
 func (fp FilePicker) IsCanceled() bool { return fp.canceled }
 func (fp FilePicker) Chosen() string   { return fp.chosen }
+
+func (fp FilePicker) selectedDir() string {
+	if len(fp.entries) == 0 || fp.cursor < 0 || fp.cursor >= len(fp.entries) {
+		return fp.currentDir
+	}
+	entry := fp.entries[fp.cursor]
+	if !entry.IsDir() {
+		return fp.currentDir
+	}
+	return filepath.Join(fp.currentDir, entry.Name())
+}
 
 func readDir(dir, filter string) ([]os.DirEntry, error) {
 	entries, err := os.ReadDir(dir)
