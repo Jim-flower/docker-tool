@@ -26,6 +26,9 @@ type MultiSelectModel struct {
 }
 
 func NewMultiSelect(title string, items []SelectableItem, visibleHeight int) MultiSelectModel {
+	if visibleHeight < 1 {
+		visibleHeight = 1
+	}
 	return MultiSelectModel{
 		title:    title,
 		items:    items,
@@ -55,6 +58,9 @@ func (m MultiSelectModel) Update(msg tea.Msg) (MultiSelectModel, tea.Cmd) {
 				}
 			}
 		case " ":
+			if len(m.items) == 0 {
+				break
+			}
 			if _, ok := m.selected[m.cursor]; ok {
 				delete(m.selected, m.cursor)
 			} else {
@@ -69,7 +75,9 @@ func (m MultiSelectModel) Update(msg tea.Msg) (MultiSelectModel, tea.Cmd) {
 				}
 			}
 		case "enter":
-			m.done = true
+			if len(m.items) > 0 {
+				m.done = true
+			}
 		case "esc", "q":
 			m.canceled = true
 		}
@@ -88,6 +96,11 @@ func (m MultiSelectModel) View() string {
 	end := m.offset + m.height
 	if end > len(m.items) {
 		end = len(m.items)
+	}
+
+	if len(m.items) == 0 {
+		sb.WriteString(styleMuted.Render("  (no items found)"))
+		sb.WriteString("\n")
 	}
 
 	for i := m.offset; i < end; i++ {

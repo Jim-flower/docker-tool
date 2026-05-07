@@ -18,6 +18,7 @@ type screen int
 
 const (
 	screenMenu screen = iota
+	screenLoading
 	screenImageList
 	screenVolumeList
 	screenExportDest
@@ -60,9 +61,20 @@ type App struct {
 	importFilePath        string
 	results               []string
 	errMsg                string
+	loadingMsg            string
 
 	windowWidth  int
 	windowHeight int
+}
+
+type imageListLoadedMsg struct {
+	images []dockerclient.Image
+	err    error
+}
+
+type volumeListLoadedMsg struct {
+	volumes []dockerclient.Volume
+	err     error
 }
 
 var menuItems = []string{
@@ -89,6 +101,12 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.windowHeight = msg.Height
 		return a, nil
 
+	case imageListLoadedMsg:
+		return a.handleImageListLoaded(msg)
+
+	case volumeListLoadedMsg:
+		return a.handleVolumeListLoaded(msg)
+
 	case tea.KeyMsg:
 		return a.handleKey(msg)
 	}
@@ -99,6 +117,13 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch a.screen {
 	case screenMenu:
 		return a.handleMenu(msg)
+	case screenLoading:
+		if msg.String() == "esc" || msg.String() == "q" || msg.String() == "ctrl+c" {
+			a.screen = screenMenu
+		}
+		if msg.String() == "ctrl+c" {
+			return a, tea.Quit
+		}
 	case screenImageList, screenVolumeList:
 		return a.handleList(msg)
 	case screenExportDest:
@@ -134,39 +159,18 @@ func (a *App) handleMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (a *App) activateMenuItem() (tea.Model, tea.Cmd) {
-	ctx := context.Background()
 	switch a.menuIdx {
 	case 0: // Export Images
-		imgs, err := a.dc.ListImages(ctx)
-		if err != nil {
-			a.errMsg = err.Error()
-			a.screen = screenError
-			return a, nil
-		}
-		a.images = imgs
-		items := make([]SelectableItem, len(imgs))
-		for i, img := range imgs {
-			items[i] = imageItem{img}
-		}
-		a.multiSelect = NewMultiSelect("Select Images to Export", items, listHeight(a.windowHeight))
 		a.action = actionExportImages
-		a.screen = screenImageList
+		a.loadingMsg = "Loading Docker images..."
+		a.screen = screenLoading
+		return a, loadImagesCmd(a.dc)
 
 	case 1: // Export Volumes
-		vols, err := a.dc.ListVolumes(ctx)
-		if err != nil {
-			a.errMsg = err.Error()
-			a.screen = screenError
-			return a, nil
-		}
-		a.volumes = vols
-		items := make([]SelectableItem, len(vols))
-		for i, v := range vols {
-			items[i] = volumeItem{v}
-		}
-		a.multiSelect = NewMultiSelect("Select Volumes to Export", items, listHeight(a.windowHeight))
 		a.action = actionExportVolumes
-		a.screen = screenVolumeList
+		a.loadingMsg = "Loading Docker volumes..."
+		a.screen = screenLoading
+		return a, loadVolumesCmd(a.dc)
 
 	case 2: // Import Images
 		home, _ := os.UserHomeDir()
@@ -183,6 +187,60 @@ func (a *App) activateMenuItem() (tea.Model, tea.Cmd) {
 	case 4: // Quit
 		return a, tea.Quit
 	}
+	return a, nil
+}
+
+func loadImagesCmd(dc *dockerclient.Client) tea.Cmd {
+	return func() tea.Msg {
+		imgs, err := dc.ListImages(context.Background())
+		return imageListLoadedMsg{images: imgs, err: err}
+	}
+}
+
+func loadVolumesCmd(dc *dockerclient.Client) tea.Cmd {
+	return func() tea.Msg {
+		vols, err := dc.ListVolumes(context.Background())
+		return volumeListLoadedMsg{volumes: vols, err: err}
+	}
+}
+
+func (a *App) handleImageListLoaded(msg imageListLoadedMsg) (tea.Model, tea.Cmd) {
+	if a.screen != screenLoading || a.action != actionExportImages {
+		return a, nil
+	}
+	if msg.err != nil {
+		a.errMsg = msg.err.Error()
+		a.screen = screenError
+		return a, nil
+	}
+	a.images = msg.images
+	items := make([]SelectableItem, len(msg.images))
+	for i, img := range msg.images {
+		items[i] = imageItem{img}
+	}
+	a.multiSelect = NewMultiSelect("Select Images to Export", items, listHeight(a.windowHeight))
+	a.action = actionExportImages
+	a.screen = screenImageList
+	return a, nil
+}
+
+func (a *App) handleVolumeListLoaded(msg volumeListLoadedMsg) (tea.Model, tea.Cmd) {
+	if a.screen != screenLoading || a.action != actionExportVolumes {
+		return a, nil
+	}
+	if msg.err != nil {
+		a.errMsg = msg.err.Error()
+		a.screen = screenError
+		return a, nil
+	}
+	a.volumes = msg.volumes
+	items := make([]SelectableItem, len(msg.volumes))
+	for i, v := range msg.volumes {
+		items[i] = volumeItem{v}
+	}
+	a.multiSelect = NewMultiSelect("Select Volumes to Export", items, listHeight(a.windowHeight))
+	a.action = actionExportVolumes
+	a.screen = screenVolumeList
 	return a, nil
 }
 
@@ -375,6 +433,11 @@ func (a *App) View() string {
 			}
 		}
 		sb.WriteString(styleHelp.Render("\n  ↑/↓ navigate  •  enter select  •  q quit"))
+
+	case screenLoading:
+		sb.WriteString(styleTitle.Render("Please Wait") + "\n\n")
+		sb.WriteString(styleNormal.Render("  "+a.loadingMsg) + "\n")
+		sb.WriteString(styleHelp.Render("\n  esc return to menu"))
 
 	case screenImageList, screenVolumeList:
 		sb.WriteString(a.multiSelect.View())
