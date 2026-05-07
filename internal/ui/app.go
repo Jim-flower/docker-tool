@@ -470,6 +470,11 @@ func (a *App) handleExportProgress(msg exportProgressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	if progress.Done {
+		if progress.ScriptErr != nil {
+			a.exportProgress.lines = append(a.exportProgress.lines, styleError.Render("✗ import script: "+progress.ScriptErr.Error()))
+		} else if progress.ScriptPath != "" {
+			a.exportProgress.lines = append(a.exportProgress.lines, styleSuccess.Render("✔ Import script → "+progress.ScriptPath))
+		}
 		a.results = a.exportProgress.lines
 		a.screen = screenResults
 		return a, nil

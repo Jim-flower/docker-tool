@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -23,12 +24,14 @@ type ExportResult struct {
 
 // ExportProgress reports item-level export progress.
 type ExportProgress struct {
-	Index     int
-	Total     int
-	Name      string
-	Result    ExportResult
-	HasResult bool
-	Done      bool
+	Index      int
+	Total      int
+	Name       string
+	Result     ExportResult
+	HasResult  bool
+	ScriptPath string
+	ScriptErr  error
+	Done       bool
 }
 
 // ExportImages saves the selected images as .tar files into destDir.
@@ -53,8 +56,9 @@ func ExportImagesWithProgress(ctx context.Context, dc *dockerclient.Client, imag
 			onProgress(ExportProgress{Index: i + 1, Total: total, Name: name, Result: result, HasResult: true})
 		}
 	}
+	scriptPath, scriptErr := WriteImageImportScript(destDir, results)
 	if onProgress != nil {
-		onProgress(ExportProgress{Index: total, Total: total, Done: true})
+		onProgress(ExportProgress{Index: total, Total: total, ScriptPath: scriptPath, ScriptErr: scriptErr, Done: true})
 	}
 	return results
 }
@@ -106,8 +110,9 @@ func ExportVolumesWithProgress(ctx context.Context, dc *dockerclient.Client, vol
 			onProgress(ExportProgress{Index: i + 1, Total: total, Name: volName, Result: result, HasResult: true})
 		}
 	}
+	scriptPath, scriptErr := WriteVolumeImportScript(destDir, results)
 	if onProgress != nil {
-		onProgress(ExportProgress{Index: total, Total: total, Done: true})
+		onProgress(ExportProgress{Index: total, Total: total, ScriptPath: scriptPath, ScriptErr: scriptErr, Done: true})
 	}
 	return results
 }
@@ -172,6 +177,124 @@ func exportSingleVolume(ctx context.Context, cli *client.Client, volName, destDi
 	}
 
 	return ExportResult{Name: volName, FilePath: outPath}
+}
+
+// WriteImageImportScript writes shell scripts that import exported image tar files.
+func WriteImageImportScript(destDir string, results []ExportResult) (string, error) {
+	scriptPath := filepath.Join(destDir, "import-images.sh")
+	lines := []string{
+		"#!/usr/bin/env sh",
+		"set -eu",
+		`SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)`,
+		`command -v docker >/dev/null 2>&1 || { echo "docker is required" >&2; exit 1; }`,
+		`echo "Importing Docker images..."`,
+	}
+
+	count := 0
+	for _, result := range results {
+		if result.Err != nil || result.FilePath == "" {
+			continue
+		}
+		relPath, err := filepath.Rel(destDir, result.FilePath)
+		if err != nil {
+			relPath = filepath.Base(result.FilePath)
+		}
+		relPath = filepath.ToSlash(relPath)
+		lines = append(lines,
+			fmt.Sprintf(`echo "Loading image: %s"`, escapeDoubleQuoted(result.Name)),
+			fmt.Sprintf(`docker load -i "$SCRIPT_DIR"/%s`, shellQuote(relPath)),
+		)
+		count++
+	}
+
+	if count == 0 {
+		lines = append(lines, `echo "No image archives found in this export."`)
+	}
+	lines = append(lines, `echo "Image import complete."`, "")
+
+	if err := os.WriteFile(scriptPath, []byte(strings.Join(lines, "\n")), 0o755); err != nil {
+		return scriptPath, err
+	}
+	if err := writeImportLauncherScript(destDir); err != nil {
+		return scriptPath, err
+	}
+	return scriptPath, nil
+}
+
+// WriteVolumeImportScript writes shell scripts that import exported volume tar files.
+func WriteVolumeImportScript(destDir string, results []ExportResult) (string, error) {
+	scriptPath := filepath.Join(destDir, "import-volumes.sh")
+	lines := []string{
+		"#!/usr/bin/env sh",
+		"set -eu",
+		`SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)`,
+		`command -v docker >/dev/null 2>&1 || { echo "docker is required" >&2; exit 1; }`,
+		`echo "Importing Docker volumes..."`,
+	}
+
+	count := 0
+	for _, result := range results {
+		if result.Err != nil || result.FilePath == "" {
+			continue
+		}
+		relPath, err := filepath.Rel(destDir, result.FilePath)
+		if err != nil {
+			relPath = filepath.Base(result.FilePath)
+		}
+		relPath = filepath.ToSlash(relPath)
+		lines = append(lines,
+			fmt.Sprintf(`echo "Restoring volume: %s"`, escapeDoubleQuoted(result.Name)),
+			fmt.Sprintf(`docker volume create %s >/dev/null`, shellQuote(result.Name)),
+			fmt.Sprintf(`docker run --rm -i -v %s alpine:latest sh -c 'tar -xf - -C /data' < "$SCRIPT_DIR"/%s`, shellQuote(result.Name+":/data"), shellQuote(relPath)),
+		)
+		count++
+	}
+
+	if count == 0 {
+		lines = append(lines, `echo "No volume archives found in this export."`)
+	}
+	lines = append(lines, `echo "Volume import complete."`, "")
+
+	if err := os.WriteFile(scriptPath, []byte(strings.Join(lines, "\n")), 0o755); err != nil {
+		return scriptPath, err
+	}
+	if err := writeImportLauncherScript(destDir); err != nil {
+		return scriptPath, err
+	}
+	return scriptPath, nil
+}
+
+func writeImportLauncherScript(destDir string) error {
+	scriptPath := filepath.Join(destDir, "import.sh")
+	lines := []string{
+		"#!/usr/bin/env sh",
+		"set -eu",
+		`SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)`,
+		`if [ -f "$SCRIPT_DIR/import-images.sh" ]; then`,
+		`  sh "$SCRIPT_DIR/import-images.sh"`,
+		`fi`,
+		`if [ -f "$SCRIPT_DIR/import-volumes.sh" ]; then`,
+		`  sh "$SCRIPT_DIR/import-volumes.sh"`,
+		`fi`,
+		`echo "All imports complete."`,
+		"",
+	}
+	return os.WriteFile(scriptPath, []byte(strings.Join(lines, "\n")), 0o755)
+}
+
+func shellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func escapeDoubleQuoted(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `"`, `\"`)
+	value = strings.ReplaceAll(value, `$`, `\$`)
+	value = strings.ReplaceAll(value, "`", "\\`")
+	return value
 }
 
 // stripDockerMux reads the docker multiplexed stream and writes only stdout to w.
