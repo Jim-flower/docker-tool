@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/docker/go-units"
@@ -89,11 +91,14 @@ type exportProgressState struct {
 	completed int
 	total     int
 	lines     []string
+	spinner   int
 }
 
 type exportProgressMsg struct {
 	progress operations.ExportProgress
 }
+
+type exportSpinnerTickMsg struct{}
 
 var menuItems = []string{
 	"Export Images",
@@ -128,6 +133,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case exportProgressMsg:
 		return a.handleExportProgress(msg)
+
+	case exportSpinnerTickMsg:
+		return a.handleExportSpinnerTick()
 
 	case tea.KeyMsg:
 		return a.handleKey(msg)
@@ -205,14 +213,12 @@ func (a *App) activateMenuItem() (tea.Model, tea.Cmd) {
 		return a, loadVolumesCmd(a.dc)
 
 	case 3: // Import Images
-		home, _ := os.UserHomeDir()
-		a.filePicker = NewFilePicker(home, ".tar", listHeight(a.windowHeight))
+		a.filePicker = NewFilePicker(defaultFilePickerDir(), ".tar", listHeight(a.windowHeight))
 		a.action = actionImportImages
 		a.screen = screenImportFile
 
 	case 4: // Import Volumes
-		home, _ := os.UserHomeDir()
-		a.filePicker = NewFilePicker(home, ".tar", listHeight(a.windowHeight))
+		a.filePicker = NewFilePicker(defaultFilePickerDir(), ".tar", listHeight(a.windowHeight))
 		a.action = actionImportVolumes
 		a.screen = screenImportFile
 
@@ -333,9 +339,11 @@ func (a *App) handleList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (a *App) handleExportDest(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
-		destDir := strings.TrimSpace(a.inputBuffer)
-		if destDir == "" {
-			destDir = "."
+		destDir, err := resolvePathInput(a.inputBuffer)
+		if err != nil {
+			a.errMsg = "Cannot resolve destination directory: " + err.Error()
+			a.screen = screenError
+			return a, nil
 		}
 		if err := os.MkdirAll(destDir, 0o755); err != nil {
 			a.errMsg = "Cannot create destination directory: " + err.Error()
@@ -345,13 +353,18 @@ func (a *App) handleExportDest(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a.startExport(destDir)
 	case "esc":
 		a.screen = screenMenu
-	case "backspace":
-		if len(a.inputBuffer) > 0 {
-			a.inputBuffer = a.inputBuffer[:len(a.inputBuffer)-1]
+	case "backspace", "ctrl+h":
+		runes := []rune(a.inputBuffer)
+		if len(runes) > 0 {
+			a.inputBuffer = string(runes[:len(runes)-1])
 		}
+	case "ctrl+u":
+		a.inputBuffer = ""
 	default:
-		if len(msg.String()) == 1 {
-			a.inputBuffer += msg.String()
+		if msg.Type == tea.KeySpace {
+			a.inputBuffer += " "
+		} else if msg.Type == tea.KeyRunes {
+			a.inputBuffer += string(msg.Runes)
 		}
 	}
 	return a, nil
@@ -389,7 +402,7 @@ func (a *App) startExport(destDir string) (tea.Model, tea.Cmd) {
 		}()
 	}
 
-	return a, waitExportProgressCmd(progressCh)
+	return a, tea.Batch(waitExportProgressCmd(progressCh), exportSpinnerTickCmd())
 }
 
 func waitExportProgressCmd(progressCh <-chan operations.ExportProgress) tea.Cmd {
@@ -431,6 +444,20 @@ func (a *App) handleExportProgress(msg exportProgressMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return a, waitExportProgressCmd(a.exportProgressCh)
+}
+
+func exportSpinnerTickCmd() tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg {
+		return exportSpinnerTickMsg{}
+	})
+}
+
+func (a *App) handleExportSpinnerTick() (tea.Model, tea.Cmd) {
+	if a.screen != screenExportProgress {
+		return a, nil
+	}
+	a.exportProgress.spinner++
+	return a, exportSpinnerTickCmd()
 }
 
 // ---- Import file picker ----
@@ -536,8 +563,9 @@ func (a *App) View() string {
 	case screenExportDest:
 		sb.WriteString(styleTitle.Render("Export Destination") + "\n\n")
 		sb.WriteString(styleNormal.Render("  Directory path (leave blank for current directory):") + "\n")
+		sb.WriteString(styleMuted.Render("  Current: "+defaultFilePickerDir()) + "\n")
 		sb.WriteString(styleSelected.Render("  > "+a.inputBuffer+"█") + "\n")
-		sb.WriteString(styleHelp.Render("\n  enter confirm  •  esc cancel"))
+		sb.WriteString(styleHelp.Render("\n  enter confirm  •  backspace delete  •  ctrl+u clear  •  esc cancel"))
 
 	case screenExportProgress:
 		sb.WriteString(styleTitle.Render("Exporting") + "\n\n")
@@ -546,7 +574,7 @@ func (a *App) View() string {
 		if total == 0 {
 			total = 1
 		}
-		sb.WriteString(styleNormal.Render(fmt.Sprintf("  %d/%d complete", completed, total)) + "\n")
+		sb.WriteString(styleNormal.Render(fmt.Sprintf("  Working %s  %d/%d complete", spinnerFrame(a.exportProgress.spinner), completed, total)) + "\n")
 		sb.WriteString("  " + renderProgressBar(completed, total, 30) + "\n")
 		if a.exportProgress.current != "" && completed < total {
 			sb.WriteString(styleMuted.Render("  Current: "+a.exportProgress.current) + "\n")
@@ -618,6 +646,61 @@ func listHeight(windowHeight int) int {
 		return windowHeight - 10
 	}
 	return 10
+}
+
+func defaultFilePickerDir() string {
+	wd, err := os.Getwd()
+	home, homeErr := os.UserHomeDir()
+	if err == nil && wd != "" && (homeErr != nil || filepath.Clean(wd) != filepath.Clean(home)) {
+		return wd
+	}
+
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		if exeDir != "." && exeDir != "" {
+			return exeDir
+		}
+	}
+
+	if err == nil && wd != "" {
+		return wd
+	}
+	if homeErr == nil && home != "" {
+		return home
+	}
+	return "."
+}
+
+func resolvePathInput(input string) (string, error) {
+	path := strings.TrimSpace(input)
+	if path == "" {
+		path = "."
+	}
+	path = os.ExpandEnv(path)
+	if strings.HasPrefix(path, "~") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		if path == "~" {
+			path = home
+		} else if strings.HasPrefix(path, "~/") || strings.HasPrefix(path, "~\\") {
+			path = filepath.Join(home, path[2:])
+		}
+	}
+	if !filepath.IsAbs(path) {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", err
+		}
+		path = filepath.Join(wd, path)
+	}
+	return filepath.Clean(path), nil
+}
+
+func spinnerFrame(index int) string {
+	frames := []string{"|", "/", "-", "\\"}
+	return frames[index%len(frames)]
 }
 
 func renderProgressBar(completed, total, width int) string {
