@@ -22,6 +22,7 @@ const (
 	screenImageList
 	screenVolumeList
 	screenExportDest
+	screenExportProgress
 	screenImportFile
 	screenImportVolumeName
 	screenResults
@@ -34,6 +35,7 @@ type action int
 const (
 	actionNone action = iota
 	actionExportImages
+	actionExportRunningContainerImages
 	actionExportVolumes
 	actionImportImages
 	actionImportVolumes
@@ -62,14 +64,19 @@ type App struct {
 	results               []string
 	errMsg                string
 	loadingMsg            string
+	exportProgress        exportProgressState
+	exportProgressCh      <-chan operations.ExportProgress
 
 	windowWidth  int
 	windowHeight int
 }
 
 type imageListLoadedMsg struct {
-	images []dockerclient.Image
-	err    error
+	images       []dockerclient.Image
+	err          error
+	sourceAction action
+	title        string
+	selectAll    bool
 }
 
 type volumeListLoadedMsg struct {
@@ -77,8 +84,20 @@ type volumeListLoadedMsg struct {
 	err     error
 }
 
+type exportProgressState struct {
+	current   string
+	completed int
+	total     int
+	lines     []string
+}
+
+type exportProgressMsg struct {
+	progress operations.ExportProgress
+}
+
 var menuItems = []string{
 	"Export Images",
+	"Export Running Container Images",
 	"Export Volumes",
 	"Import Images",
 	"Import Volumes",
@@ -107,6 +126,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case volumeListLoadedMsg:
 		return a.handleVolumeListLoaded(msg)
 
+	case exportProgressMsg:
+		return a.handleExportProgress(msg)
+
 	case tea.KeyMsg:
 		return a.handleKey(msg)
 	}
@@ -128,6 +150,10 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a.handleList(msg)
 	case screenExportDest:
 		return a.handleExportDest(msg)
+	case screenExportProgress:
+		if msg.String() == "ctrl+c" {
+			return a, tea.Quit
+		}
 	case screenImportFile:
 		return a.handleImportFile(msg)
 	case screenImportVolumeName:
@@ -166,25 +192,31 @@ func (a *App) activateMenuItem() (tea.Model, tea.Cmd) {
 		a.screen = screenLoading
 		return a, loadImagesCmd(a.dc)
 
-	case 1: // Export Volumes
+	case 1: // Export Running Container Images
+		a.action = actionExportRunningContainerImages
+		a.loadingMsg = "Loading images from running containers..."
+		a.screen = screenLoading
+		return a, loadRunningContainerImagesCmd(a.dc)
+
+	case 2: // Export Volumes
 		a.action = actionExportVolumes
 		a.loadingMsg = "Loading Docker volumes..."
 		a.screen = screenLoading
 		return a, loadVolumesCmd(a.dc)
 
-	case 2: // Import Images
+	case 3: // Import Images
 		home, _ := os.UserHomeDir()
 		a.filePicker = NewFilePicker(home, ".tar", listHeight(a.windowHeight))
 		a.action = actionImportImages
 		a.screen = screenImportFile
 
-	case 3: // Import Volumes
+	case 4: // Import Volumes
 		home, _ := os.UserHomeDir()
 		a.filePicker = NewFilePicker(home, ".tar", listHeight(a.windowHeight))
 		a.action = actionImportVolumes
 		a.screen = screenImportFile
 
-	case 4: // Quit
+	case 5: // Quit
 		return a, tea.Quit
 	}
 	return a, nil
@@ -193,7 +225,25 @@ func (a *App) activateMenuItem() (tea.Model, tea.Cmd) {
 func loadImagesCmd(dc *dockerclient.Client) tea.Cmd {
 	return func() tea.Msg {
 		imgs, err := dc.ListImages(context.Background())
-		return imageListLoadedMsg{images: imgs, err: err}
+		return imageListLoadedMsg{
+			images:       imgs,
+			err:          err,
+			sourceAction: actionExportImages,
+			title:        "Select Images to Export",
+		}
+	}
+}
+
+func loadRunningContainerImagesCmd(dc *dockerclient.Client) tea.Cmd {
+	return func() tea.Msg {
+		imgs, err := dc.ListRunningContainerImages(context.Background())
+		return imageListLoadedMsg{
+			images:       imgs,
+			err:          err,
+			sourceAction: actionExportRunningContainerImages,
+			title:        "Select Running Container Images to Export",
+			selectAll:    true,
+		}
 	}
 }
 
@@ -205,7 +255,7 @@ func loadVolumesCmd(dc *dockerclient.Client) tea.Cmd {
 }
 
 func (a *App) handleImageListLoaded(msg imageListLoadedMsg) (tea.Model, tea.Cmd) {
-	if a.screen != screenLoading || a.action != actionExportImages {
+	if a.screen != screenLoading || a.action != msg.sourceAction {
 		return a, nil
 	}
 	if msg.err != nil {
@@ -218,8 +268,11 @@ func (a *App) handleImageListLoaded(msg imageListLoadedMsg) (tea.Model, tea.Cmd)
 	for i, img := range msg.images {
 		items[i] = imageItem{img}
 	}
-	a.multiSelect = NewMultiSelect("Select Images to Export", items, listHeight(a.windowHeight))
-	a.action = actionExportImages
+	a.multiSelect = NewMultiSelect(msg.title, items, listHeight(a.windowHeight))
+	if msg.selectAll {
+		a.multiSelect = a.multiSelect.SelectAll()
+	}
+	a.action = msg.sourceAction
 	a.screen = screenImageList
 	return a, nil
 }
@@ -263,7 +316,7 @@ func (a *App) handleList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		sort.Ints(indices)
 
-		if a.action == actionExportImages {
+		if a.action == actionExportImages || a.action == actionExportRunningContainerImages {
 			a.selectedImageIndices = indices
 		} else {
 			a.selectedVolumeIndices = indices
@@ -289,7 +342,7 @@ func (a *App) handleExportDest(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.screen = screenError
 			return a, nil
 		}
-		a.runExport(destDir)
+		return a.startExport(destDir)
 	case "esc":
 		a.screen = screenMenu
 	case "backspace":
@@ -304,42 +357,80 @@ func (a *App) handleExportDest(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
-func (a *App) runExport(destDir string) {
-	ctx := context.Background()
-	var lines []string
+func (a *App) startExport(destDir string) (tea.Model, tea.Cmd) {
+	progressCh := make(chan operations.ExportProgress)
+	a.exportProgressCh = progressCh
+	a.exportProgress = exportProgressState{}
+	a.screen = screenExportProgress
 
-	if a.action == actionExportImages {
+	if a.action == actionExportImages || a.action == actionExportRunningContainerImages {
 		ids := make([]string, len(a.selectedImageIndices))
 		names := make([]string, len(a.selectedImageIndices))
 		for i, idx := range a.selectedImageIndices {
 			ids[i] = a.images[idx].ID
 			names[i] = a.images[idx].DisplayName()
 		}
-		results := operations.ExportImages(ctx, a.dc, ids, names, destDir)
-		for _, r := range results {
-			if r.Err != nil {
-				lines = append(lines, styleError.Render("✗ "+r.Name+": "+r.Err.Error()))
-			} else {
-				lines = append(lines, styleSuccess.Render("✔ "+r.Name+" → "+r.FilePath))
-			}
-		}
+		go func() {
+			defer close(progressCh)
+			operations.ExportImagesWithProgress(context.Background(), a.dc, ids, names, destDir, func(progress operations.ExportProgress) {
+				progressCh <- progress
+			})
+		}()
 	} else {
 		names := make([]string, len(a.selectedVolumeIndices))
 		for i, idx := range a.selectedVolumeIndices {
 			names[i] = a.volumes[idx].Name
 		}
-		results := operations.ExportVolumes(ctx, a.dc, names, destDir)
-		for _, r := range results {
-			if r.Err != nil {
-				lines = append(lines, styleError.Render("✗ "+r.Name+": "+r.Err.Error()))
-			} else {
-				lines = append(lines, styleSuccess.Render("✔ "+r.Name+" → "+r.FilePath))
-			}
-		}
+		go func() {
+			defer close(progressCh)
+			operations.ExportVolumesWithProgress(context.Background(), a.dc, names, destDir, func(progress operations.ExportProgress) {
+				progressCh <- progress
+			})
+		}()
 	}
 
-	a.results = lines
-	a.screen = screenResults
+	return a, waitExportProgressCmd(progressCh)
+}
+
+func waitExportProgressCmd(progressCh <-chan operations.ExportProgress) tea.Cmd {
+	return func() tea.Msg {
+		progress, ok := <-progressCh
+		if !ok {
+			return exportProgressMsg{progress: operations.ExportProgress{Done: true}}
+		}
+		return exportProgressMsg{progress: progress}
+	}
+}
+
+func (a *App) handleExportProgress(msg exportProgressMsg) (tea.Model, tea.Cmd) {
+	if a.screen != screenExportProgress {
+		return a, nil
+	}
+
+	progress := msg.progress
+	if progress.Total > 0 {
+		a.exportProgress.total = progress.Total
+	}
+	if progress.Name != "" {
+		a.exportProgress.current = progress.Name
+	}
+	if progress.Index >= 0 {
+		a.exportProgress.completed = progress.Index
+	}
+	if progress.HasResult {
+		if progress.Result.Err != nil {
+			a.exportProgress.lines = append(a.exportProgress.lines, styleError.Render("✗ "+progress.Result.Name+": "+progress.Result.Err.Error()))
+		} else {
+			a.exportProgress.lines = append(a.exportProgress.lines, styleSuccess.Render("✔ "+progress.Result.Name+" → "+progress.Result.FilePath))
+		}
+	}
+	if progress.Done {
+		a.results = a.exportProgress.lines
+		a.screen = screenResults
+		return a, nil
+	}
+
+	return a, waitExportProgressCmd(a.exportProgressCh)
 }
 
 // ---- Import file picker ----
@@ -448,6 +539,30 @@ func (a *App) View() string {
 		sb.WriteString(styleSelected.Render("  > "+a.inputBuffer+"█") + "\n")
 		sb.WriteString(styleHelp.Render("\n  enter confirm  •  esc cancel"))
 
+	case screenExportProgress:
+		sb.WriteString(styleTitle.Render("Exporting") + "\n\n")
+		total := a.exportProgress.total
+		completed := a.exportProgress.completed
+		if total == 0 {
+			total = 1
+		}
+		sb.WriteString(styleNormal.Render(fmt.Sprintf("  %d/%d complete", completed, total)) + "\n")
+		sb.WriteString("  " + renderProgressBar(completed, total, 30) + "\n")
+		if a.exportProgress.current != "" && completed < total {
+			sb.WriteString(styleMuted.Render("  Current: "+a.exportProgress.current) + "\n")
+		}
+		if len(a.exportProgress.lines) > 0 {
+			sb.WriteString("\n")
+			start := len(a.exportProgress.lines) - 6
+			if start < 0 {
+				start = 0
+			}
+			for _, line := range a.exportProgress.lines[start:] {
+				sb.WriteString("  " + line + "\n")
+			}
+		}
+		sb.WriteString(styleHelp.Render("\n  Please wait  •  ctrl+c quit"))
+
 	case screenImportFile:
 		sb.WriteString(a.filePicker.View())
 
@@ -487,7 +602,15 @@ type volumeItem struct{ vol dockerclient.Volume }
 
 func (v volumeItem) DisplayName() string { return v.vol.Name }
 func (v volumeItem) SubText() string {
-	return fmt.Sprintf("Driver: %s  Mount: %s", v.vol.Driver, v.vol.Mountpoint)
+	size := "unknown"
+	if v.vol.Size >= 0 {
+		size = units.HumanSize(float64(v.vol.Size))
+	}
+	refCount := "unknown"
+	if v.vol.RefCount >= 0 {
+		refCount = fmt.Sprintf("%d", v.vol.RefCount)
+	}
+	return fmt.Sprintf("Driver: %s  Size: %s  Ref: %s  Mount: %s", v.vol.Driver, size, refCount, v.vol.Mountpoint)
 }
 
 func listHeight(windowHeight int) int {
@@ -495,4 +618,23 @@ func listHeight(windowHeight int) int {
 		return windowHeight - 10
 	}
 	return 10
+}
+
+func renderProgressBar(completed, total, width int) string {
+	if width < 1 {
+		width = 1
+	}
+	if total < 1 {
+		total = 1
+	}
+	if completed < 0 {
+		completed = 0
+	}
+	if completed > total {
+		completed = total
+	}
+
+	filled := completed * width / total
+	return styleSelected.Render("["+strings.Repeat("=", filled)+strings.Repeat(" ", width-filled)+"]") +
+		styleMuted.Render(fmt.Sprintf(" %d%%", completed*100/total))
 }

@@ -21,15 +21,40 @@ type ExportResult struct {
 	Err      error
 }
 
+// ExportProgress reports item-level export progress.
+type ExportProgress struct {
+	Index     int
+	Total     int
+	Name      string
+	Result    ExportResult
+	HasResult bool
+	Done      bool
+}
+
 // ExportImages saves the selected images as .tar files into destDir.
 func ExportImages(ctx context.Context, dc *dockerclient.Client, imageIDs []string, imageNames []string, destDir string) []ExportResult {
+	return ExportImagesWithProgress(ctx, dc, imageIDs, imageNames, destDir, nil)
+}
+
+// ExportImagesWithProgress saves images and reports progress before and after each item.
+func ExportImagesWithProgress(ctx context.Context, dc *dockerclient.Client, imageIDs []string, imageNames []string, destDir string, onProgress func(ExportProgress)) []ExportResult {
 	results := make([]ExportResult, 0, len(imageIDs))
 	cli := dc.Raw()
+	total := len(imageIDs)
 
 	for i, id := range imageIDs {
 		name := imageNames[i]
+		if onProgress != nil {
+			onProgress(ExportProgress{Index: i, Total: total, Name: name})
+		}
 		result := exportSingleImage(ctx, cli, id, name, destDir)
 		results = append(results, result)
+		if onProgress != nil {
+			onProgress(ExportProgress{Index: i + 1, Total: total, Name: name, Result: result, HasResult: true})
+		}
+	}
+	if onProgress != nil {
+		onProgress(ExportProgress{Index: total, Total: total, Done: true})
 	}
 	return results
 }
@@ -62,12 +87,27 @@ func exportSingleImage(ctx context.Context, cli *client.Client, id, name, destDi
 // ExportVolumes archives the selected volume data as .tar files into destDir.
 // It spins up a temporary Alpine container that mounts the volume and streams a tar archive.
 func ExportVolumes(ctx context.Context, dc *dockerclient.Client, volumeNames []string, destDir string) []ExportResult {
+	return ExportVolumesWithProgress(ctx, dc, volumeNames, destDir, nil)
+}
+
+// ExportVolumesWithProgress archives volumes and reports progress before and after each item.
+func ExportVolumesWithProgress(ctx context.Context, dc *dockerclient.Client, volumeNames []string, destDir string, onProgress func(ExportProgress)) []ExportResult {
 	results := make([]ExportResult, 0, len(volumeNames))
 	cli := dc.Raw()
+	total := len(volumeNames)
 
-	for _, volName := range volumeNames {
+	for i, volName := range volumeNames {
+		if onProgress != nil {
+			onProgress(ExportProgress{Index: i, Total: total, Name: volName})
+		}
 		result := exportSingleVolume(ctx, cli, volName, destDir)
 		results = append(results, result)
+		if onProgress != nil {
+			onProgress(ExportProgress{Index: i + 1, Total: total, Name: volName, Result: result, HasResult: true})
+		}
+	}
+	if onProgress != nil {
+		onProgress(ExportProgress{Index: total, Total: total, Done: true})
 	}
 	return results
 }

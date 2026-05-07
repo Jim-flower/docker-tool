@@ -40,6 +40,14 @@ func NewMultiSelect(title string, items []SelectableItem, visibleHeight int) Mul
 
 func (m MultiSelectModel) Init() tea.Cmd { return nil }
 
+func (m MultiSelectModel) SelectAll() MultiSelectModel {
+	m.selected = make(map[int]struct{}, len(m.items))
+	for i := range m.items {
+		m.selected[i] = struct{}{}
+	}
+	return m
+}
+
 func (m MultiSelectModel) Update(msg tea.Msg) (MultiSelectModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:

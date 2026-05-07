@@ -3,8 +3,11 @@ package docker
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 )
 
@@ -48,6 +51,56 @@ func (c *Client) ListImages(ctx context.Context) ([]Image, error) {
 			Created:    s.Created,
 		})
 	}
+	return images, nil
+}
+
+// ListRunningContainerImages returns unique images used by currently running containers.
+func (c *Client) ListRunningContainerImages(ctx context.Context) ([]Image, error) {
+	containers, err := c.cli.ContainerList(ctx, container.ListOptions{
+		Filters: filters.NewArgs(filters.Arg("status", "running")),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing running containers: %w", err)
+	}
+
+	allImages, err := c.ListImages(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	imagesByID := make(map[string]Image, len(allImages))
+	for _, img := range allImages {
+		imagesByID[img.ID] = img
+	}
+
+	seen := make(map[string]struct{}, len(containers))
+	images := make([]Image, 0, len(containers))
+	for _, ctr := range containers {
+		if ctr.ImageID == "" {
+			continue
+		}
+		if _, ok := seen[ctr.ImageID]; ok {
+			continue
+		}
+		seen[ctr.ImageID] = struct{}{}
+
+		img, ok := imagesByID[ctr.ImageID]
+		if !ok {
+			repo, tag := parseRepoTag([]string{ctr.Image})
+			img = Image{
+				ID:         ctr.ImageID,
+				ShortID:    shortID(ctr.ImageID),
+				Repository: repo,
+				Tag:        tag,
+			}
+		}
+		images = append(images, img)
+	}
+
+	sort.Slice(images, func(i, j int) bool {
+		return images[i].DisplayName() < images[j].DisplayName()
+	})
+
 	return images, nil
 }
 
