@@ -84,6 +84,19 @@ func (fp FilePicker) Update(msg tea.Msg) (FilePicker, tea.Cmd) {
 			} else {
 				fp.chosen = full
 			}
+		case "right", "l":
+			if len(fp.entries) == 0 {
+				break
+			}
+			entry := fp.entries[fp.cursor]
+			if !entry.IsDir() {
+				break
+			}
+			full := filepath.Join(fp.currentDir, entry.Name())
+			fp.currentDir = full
+			fp.cursor = 0
+			fp.offset = 0
+			fp.entries, fp.err = readDir(full, fp.filter)
 		case "backspace", "left", "h":
 			parent := filepath.Dir(fp.currentDir)
 			if parent != fp.currentDir {
@@ -141,9 +154,9 @@ func (fp FilePicker) View() string {
 	}
 
 	if fp.mode == pickerModeDirectory {
-		sb.WriteString(styleHelp.Render("\n  ↑/↓ navigate  •  enter use this folder  •  ← parent dir  •  esc cancel"))
+		sb.WriteString(styleHelp.Render("\n  ↑/↓ navigate  •  → open folder  •  ← parent dir  •  enter use this folder  •  esc cancel"))
 	} else {
-		sb.WriteString(styleHelp.Render("\n  ↑/↓ navigate  •  enter open/select  •  ← parent dir  •  esc cancel"))
+		sb.WriteString(styleHelp.Render("\n  ↑/↓ navigate  •  →/enter open/select  •  ← parent dir  •  esc cancel"))
 	}
 	return sb.String()
 }
@@ -159,7 +172,7 @@ func readDir(dir, filter string) ([]os.DirEntry, error) {
 	}
 	filtered := entries[:0]
 	for _, e := range entries {
-		if e.IsDir() || filter == "" || strings.HasSuffix(e.Name(), filter) {
+		if e.IsDir() || filter == "" || strings.HasSuffix(strings.ToLower(e.Name()), strings.ToLower(filter)) {
 			filtered = append(filtered, e)
 		}
 	}

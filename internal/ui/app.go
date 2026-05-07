@@ -525,7 +525,7 @@ func (a *App) runImport() {
 	for i, idx := range a.selectedTarFileIndices {
 		file := a.tarFiles[idx]
 		filePaths[i] = file.Path
-		volumeNames[i] = volumeNameFromTar(file.Name)
+		volumeNames[i] = volumeNameFromTar(file.DisplayName())
 	}
 
 	ctx := context.Background()
@@ -699,12 +699,18 @@ func (v volumeItem) SubText() string {
 }
 
 type tarFile struct {
-	Name string
-	Path string
-	Size int64
+	Name    string
+	Path    string
+	RelPath string
+	Size    int64
 }
 
-func (t tarFile) DisplayName() string { return t.Name }
+func (t tarFile) DisplayName() string {
+	if t.RelPath != "" {
+		return t.RelPath
+	}
+	return t.Name
+}
 func (t tarFile) SubText() string {
 	return fmt.Sprintf("Size: %s  Path: %s", units.HumanSize(float64(t.Size)), t.Path)
 }
@@ -740,29 +746,36 @@ func defaultFilePickerDir() string {
 }
 
 func listTarFiles(dir string) ([]tarFile, error) {
-	entries, err := os.ReadDir(dir)
+	files := []tarFile{}
+	err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".tar") {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		relPath, err := filepath.Rel(dir, path)
+		if err != nil {
+			relPath = entry.Name()
+		}
+		files = append(files, tarFile{
+			Name:    entry.Name(),
+			Path:    path,
+			RelPath: relPath,
+			Size:    info.Size(),
+		})
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	files := make([]tarFile, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".tar") {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return nil, err
-		}
-		files = append(files, tarFile{
-			Name: entry.Name(),
-			Path: filepath.Join(dir, entry.Name()),
-			Size: info.Size(),
-		})
-	}
-
 	sort.Slice(files, func(i, j int) bool {
-		return strings.ToLower(files[i].Name) < strings.ToLower(files[j].Name)
+		return strings.ToLower(files[i].DisplayName()) < strings.ToLower(files[j].DisplayName())
 	})
 
 	return files, nil
@@ -770,6 +783,9 @@ func listTarFiles(dir string) ([]tarFile, error) {
 
 func volumeNameFromTar(name string) string {
 	name = strings.TrimSuffix(name, filepath.Ext(name))
+	name = strings.ReplaceAll(name, string(filepath.Separator), "_")
+	name = strings.ReplaceAll(name, "/", "_")
+	name = strings.ReplaceAll(name, "\\", "_")
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return "imported-volume"
