@@ -26,14 +26,15 @@ type MultiSelectModel struct {
 }
 
 func NewMultiSelect(title string, items []SelectableItem, visibleHeight int) MultiSelectModel {
-	if visibleHeight < 1 {
-		visibleHeight = 1
+	visibleItems := visibleHeight / 2
+	if visibleItems < 1 {
+		visibleItems = 1
 	}
 	return MultiSelectModel{
 		title:    title,
 		items:    items,
 		selected: make(map[int]struct{}),
-		height:   visibleHeight,
+		height:   visibleItems,
 	}
 }
 
