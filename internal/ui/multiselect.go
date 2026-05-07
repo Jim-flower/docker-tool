@@ -57,6 +57,41 @@ func (m MultiSelectModel) Update(msg tea.Msg) (MultiSelectModel, tea.Cmd) {
 					m.offset++
 				}
 			}
+		case "pgup":
+			if len(m.items) == 0 {
+				break
+			}
+			m.cursor -= m.height
+			if m.cursor < 0 {
+				m.cursor = 0
+			}
+			if m.offset > m.cursor {
+				m.offset = m.cursor
+			}
+		case "pgdown":
+			if len(m.items) == 0 {
+				break
+			}
+			m.cursor += m.height
+			if m.cursor >= len(m.items) {
+				m.cursor = len(m.items) - 1
+			}
+			if m.cursor >= m.offset+m.height {
+				m.offset = m.cursor - m.height + 1
+			}
+		case "home":
+			m.cursor = 0
+			m.offset = 0
+		case "end":
+			if len(m.items) == 0 {
+				m.cursor = 0
+				m.offset = 0
+				break
+			}
+			m.cursor = len(m.items) - 1
+			if len(m.items) > m.height {
+				m.offset = len(m.items) - m.height
+			}
 		case " ":
 			if len(m.items) == 0 {
 				break
@@ -90,7 +125,11 @@ func (m MultiSelectModel) View() string {
 
 	sb.WriteString(styleTitle.Render(m.title))
 	sb.WriteString("\n")
-	sb.WriteString(styleMuted.Render(fmt.Sprintf("  %d items  •  %d selected", len(m.items), len(m.selected))))
+	position := "0/0"
+	if len(m.items) > 0 {
+		position = fmt.Sprintf("%d/%d", m.cursor+1, len(m.items))
+	}
+	sb.WriteString(styleMuted.Render(fmt.Sprintf("  %d items  •  %d selected  •  current %s", len(m.items), len(m.selected), position)))
 	sb.WriteString("\n\n")
 
 	end := m.offset + m.height
@@ -106,31 +145,39 @@ func (m MultiSelectModel) View() string {
 	for i := m.offset; i < end; i++ {
 		item := m.items[i]
 		_, isSelected := m.selected[i]
+		isActive := i == m.cursor
 
 		cursor := "  "
-		if i == m.cursor {
-			cursor = styleCursor.Render("▶ ")
+		if isActive {
+			cursor = "> "
 		}
 
-		checkbox := styleNormal.Render("☐")
+		checkbox := "[ ]"
 		if isSelected {
-			checkbox = styleSelected.Render("☑")
+			checkbox = "[x]"
 		}
 
-		name := styleNormal.Render(item.DisplayName())
-		if i == m.cursor {
-			name = styleMenuItemActive.Render(item.DisplayName())
+		line := fmt.Sprintf("%s%s %s", cursor, checkbox, item.DisplayName())
+		sub := "    " + item.SubText()
+		if isActive {
+			sb.WriteString(styleListItemActive.Render(line) + "\n")
+			sb.WriteString(styleListSubtextActive.Render(sub) + "\n")
+			continue
 		}
 
-		sub := styleMuted.Render("  " + item.SubText())
-		sb.WriteString(fmt.Sprintf("%s%s %s\n%s\n", cursor, checkbox, name, sub))
+		if isSelected {
+			sb.WriteString(styleSelected.Render(line) + "\n")
+		} else {
+			sb.WriteString(styleNormal.Render(line) + "\n")
+		}
+		sb.WriteString(styleMuted.Render(sub) + "\n")
 	}
 
 	if len(m.items) > m.height {
 		sb.WriteString(styleMuted.Render(fmt.Sprintf("\n  Showing %d–%d of %d", m.offset+1, end, len(m.items))))
 	}
 
-	sb.WriteString(styleHelp.Render("\n  ↑/↓ navigate  •  space select  •  a select all  •  enter confirm  •  esc cancel"))
+	sb.WriteString(styleHelp.Render("\n  ↑/↓ navigate  •  pgup/pgdown page  •  space select  •  a select all  •  enter confirm  •  esc cancel"))
 	return sb.String()
 }
 

@@ -8,6 +8,7 @@ var (
 	colorDanger    = lipgloss.Color("#EF4444")
 	colorMuted     = lipgloss.Color("#6B7280")
 	colorSelected  = lipgloss.Color("#F59E0B")
+	colorActiveBg  = lipgloss.Color("#374151")
 	colorBg        = lipgloss.Color("#1F2937")
 	colorText      = lipgloss.Color("#F9FAFB")
 
@@ -61,6 +62,15 @@ var (
 	styleMenuItemActive = lipgloss.NewStyle().
 				Foreground(colorPrimary).
 				Bold(true)
+
+	styleListItemActive = lipgloss.NewStyle().
+				Foreground(colorText).
+				Background(colorActiveBg).
+				Bold(true)
+
+	styleListSubtextActive = lipgloss.NewStyle().
+				Foreground(colorText).
+				Background(colorActiveBg)
 
 	styleHeader = lipgloss.NewStyle().
 			Bold(true).
