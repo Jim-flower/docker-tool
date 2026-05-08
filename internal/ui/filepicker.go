@@ -17,7 +17,7 @@ const (
 	pickerModeDirectory
 )
 
-// FilePicker lets the user navigate and pick .tar files from the filesystem.
+// FilePicker lets the user navigate and pick .tar files or directories.
 type FilePicker struct {
 	currentDir string
 	entries    []os.DirEntry
@@ -115,48 +115,76 @@ func (fp FilePicker) Update(msg tea.Msg) (FilePicker, tea.Cmd) {
 func (fp FilePicker) View() string {
 	var sb strings.Builder
 
+	// Title
 	title := "Select File"
 	if fp.mode == pickerModeDirectory {
-		title = "Select Folder"
+		title = "Select Export Folder"
 	}
-	sb.WriteString(styleTitle.Render(title))
-	sb.WriteString("\n")
-	sb.WriteString(styleMuted.Render("  " + fp.currentDir))
-	sb.WriteString("\n\n")
+	sb.WriteString(styleTitle.Render(title) + "\n")
+
+	// Current path (truncated to reasonable length)
+	path := fp.currentDir
+	const maxPathLen = 60
+	if len(path) > maxPathLen {
+		path = "…" + path[len(path)-maxPathLen+1:]
+	}
+	sb.WriteString(styleMuted.Render("  ") + styleInfo.Render(path) + "\n\n")
 
 	if fp.err != nil {
-		sb.WriteString(styleError.Render("  Error: " + fp.err.Error()))
-		sb.WriteString("\n")
+		sb.WriteString(styleError.Render("  Error: "+fp.err.Error()) + "\n")
 	} else if len(fp.entries) == 0 {
-		sb.WriteString(styleMuted.Render("  (empty directory)"))
-		sb.WriteString("\n")
+		sb.WriteString(styleMuted.Render("  (empty directory)") + "\n")
 	} else {
 		end := fp.offset + fp.height
 		if end > len(fp.entries) {
 			end = len(fp.entries)
 		}
+
+		// Scroll-up hint
+		if fp.offset > 0 {
+			sb.WriteString(styleMuted.Render(fmt.Sprintf("  ▲ %d more above\n", fp.offset)))
+		}
+
 		for i := fp.offset; i < end; i++ {
 			entry := fp.entries[i]
-			cursor := "  "
-			if i == fp.cursor {
-				cursor = styleCursor.Render("▶ ")
+			isActive := i == fp.cursor
+
+			cur := "  "
+			if isActive {
+				cur = styleCursor.Render("▸ ")
 			}
-			icon := "📄"
+
+			var icon, name string
 			if entry.IsDir() {
-				icon = "📁"
+				icon = styleMuted.Render("▶ ")
+				if isActive {
+					name = styleMenuItemActive.Render(entry.Name() + "/")
+				} else {
+					name = styleNormal.Render(entry.Name() + "/")
+				}
+			} else {
+				icon = styleMuted.Render("  ")
+				if isActive {
+					name = styleMenuItemActive.Render(entry.Name())
+				} else {
+					name = styleMuted.Render(entry.Name())
+				}
 			}
-			name := styleNormal.Render(entry.Name())
-			if i == fp.cursor {
-				name = styleMenuItemActive.Render(entry.Name())
-			}
-			sb.WriteString(fmt.Sprintf("%s%s %s\n", cursor, icon, name))
+
+			sb.WriteString(fmt.Sprintf("%s%s%s\n", cur, icon, name))
+		}
+
+		// Scroll-down hint
+		below := len(fp.entries) - end
+		if below > 0 {
+			sb.WriteString(styleMuted.Render(fmt.Sprintf("  ▼ %d more below\n", below)))
 		}
 	}
 
 	if fp.mode == pickerModeDirectory {
-		sb.WriteString(styleHelp.Render("\n  ↑/↓ navigate  •  → open folder  •  ← parent dir  •  enter select folder  •  esc cancel"))
+		sb.WriteString(renderHelpBar("↑↓", "navigate", "→", "open", "←", "parent", "enter", "select here", "esc", "cancel"))
 	} else {
-		sb.WriteString(styleHelp.Render("\n  ↑/↓ navigate  •  →/enter open/select  •  ← parent dir  •  esc cancel"))
+		sb.WriteString(renderHelpBar("↑↓", "navigate", "→/enter", "open", "←", "parent", "esc", "cancel"))
 	}
 	return sb.String()
 }

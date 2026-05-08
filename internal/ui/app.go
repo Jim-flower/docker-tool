@@ -698,36 +698,41 @@ func (a *App) handleImportVolumeName(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (a *App) View() string {
 	var sb strings.Builder
 
-	sb.WriteString(styleHeader.Render(" Docker Tool ") + "\n\n")
+	// Full-width header banner
+	bannerWidth := max(a.windowWidth, 40)
+	sb.WriteString(styleHeader.Width(bannerWidth).Render("  Docker Tool") + "\n\n")
 
 	switch a.screen {
 	case screenMenu:
-		sb.WriteString(styleTitle.Render("Main Menu") + "\n\n")
-		for i, item := range menuItems {
-			cursor := "  "
-			if i == a.menuIdx {
-				cursor = styleMenuCursor.Render("▶ ")
-				sb.WriteString(cursor + styleMenuItemActive.Render(item) + "\n")
-			} else {
-				sb.WriteString(cursor + styleMenuItem.Render(item) + "\n")
-			}
+		// Export group
+		sb.WriteString(styleSectionLabel.Render("  EXPORT") + "\n")
+		for i := 0; i <= 2; i++ {
+			renderMenuItem(&sb, i, menuItems[i], a.menuIdx)
 		}
-		sb.WriteString(styleHelp.Render("\n  ↑/↓ navigate  •  enter select  •  q quit"))
+		sb.WriteString("\n")
+		// Import group
+		sb.WriteString(styleSectionLabel.Render("  IMPORT") + "\n")
+		for i := 3; i <= 4; i++ {
+			renderMenuItem(&sb, i, menuItems[i], a.menuIdx)
+		}
+		sb.WriteString("\n" + styleDivider.Render("  "+strings.Repeat("─", 32)) + "\n")
+		renderMenuItem(&sb, 5, menuItems[5], a.menuIdx)
+		sb.WriteString(renderHelpBar("↑↓", "navigate", "enter", "select", "q", "quit"))
 
 	case screenLoading:
 		sb.WriteString(styleTitle.Render("Please Wait") + "\n\n")
-		sb.WriteString(styleNormal.Render("  "+a.loadingMsg) + "\n")
-		sb.WriteString(styleHelp.Render("\n  esc return to menu"))
+		sb.WriteString("  " + styleMuted.Render("⣷") + "  " + styleNormal.Render(a.loadingMsg) + "\n")
+		sb.WriteString(renderHelpBar("esc", "cancel"))
 
 	case screenImageList, screenVolumeList:
 		sb.WriteString(a.multiSelect.View())
 
 	case screenExportDest:
 		sb.WriteString(styleTitle.Render("Export Destination") + "\n\n")
-		sb.WriteString(styleNormal.Render("  Directory path (leave blank for current directory):") + "\n")
-		sb.WriteString(styleMuted.Render("  Current: "+defaultFilePickerDir()) + "\n")
-		sb.WriteString(styleSelected.Render("  > "+a.inputBuffer+"█") + "\n")
-		sb.WriteString(styleHelp.Render("\n  enter confirm  •  backspace delete  •  ctrl+u clear  •  esc cancel"))
+		sb.WriteString(styleNormal.Render("  Destination directory") + "\n")
+		sb.WriteString(styleMuted.Render("  leave blank to use: "+defaultFilePickerDir()) + "\n\n")
+		sb.WriteString(styleMuted.Render("  ▸ ") + styleInput.Render(a.inputBuffer) + styleMenuCursor.Render("▌") + "\n")
+		sb.WriteString(renderHelpBar("enter", "confirm", "ctrl+u", "clear", "esc", "cancel"))
 
 	case screenExportProgress:
 		sb.WriteString(styleTitle.Render("Exporting") + "\n\n")
@@ -736,18 +741,19 @@ func (a *App) View() string {
 		if total == 0 {
 			total = 1
 		}
-		sb.WriteString(styleNormal.Render(fmt.Sprintf("  Working %s  %d/%d complete", spinnerFrame(a.exportProgress.spinner), completed, total)) + "\n")
-		sb.WriteString("  " + renderProgressBar(completed, total, 30) + "\n")
+		sb.WriteString(styleNormal.Render(fmt.Sprintf("  %s  %d / %d complete",
+			styleCursor.Render(spinnerFrame(a.exportProgress.spinner)), completed, total)) + "\n")
+		sb.WriteString("  " + renderProgressBar(completed, total, 32) + "\n")
 		if completed < total {
 			if a.exportProgress.bytesWritten > 0 {
-				line := "  Transferring"
+				label := "  Transferring"
 				if a.exportProgress.current != "" {
-					line += " " + a.exportProgress.current
+					label += "  " + styleNormal.Render(a.exportProgress.current)
 				}
-				line += "  " + units.HumanSize(float64(a.exportProgress.bytesWritten))
-				sb.WriteString(styleMuted.Render(line) + "\n")
+				label += "  " + styleInfo.Render(units.HumanSize(float64(a.exportProgress.bytesWritten)))
+				sb.WriteString(label + "\n")
 			} else if a.exportProgress.current != "" {
-				sb.WriteString(styleMuted.Render("  Current: "+a.exportProgress.current) + "\n")
+				sb.WriteString(styleMuted.Render("  Exporting  ") + styleNormal.Render(a.exportProgress.current) + "\n")
 			}
 		}
 		if len(a.exportProgress.lines) > 0 {
@@ -760,7 +766,7 @@ func (a *App) View() string {
 				sb.WriteString("  " + line + "\n")
 			}
 		}
-		sb.WriteString(styleHelp.Render("\n  Please wait  •  ctrl+c quit"))
+		sb.WriteString(renderHelpBar("ctrl+c", "quit"))
 
 	case screenImportFile:
 		sb.WriteString(a.filePicker.View())
@@ -775,10 +781,11 @@ func (a *App) View() string {
 		if total == 0 {
 			total = 1
 		}
-		sb.WriteString(styleNormal.Render(fmt.Sprintf("  Working %s  %d/%d complete", spinnerFrame(a.importProgress.spinner), completed, total)) + "\n")
-		sb.WriteString("  " + renderProgressBar(completed, total, 30) + "\n")
+		sb.WriteString(styleNormal.Render(fmt.Sprintf("  %s  %d / %d complete",
+			styleCursor.Render(spinnerFrame(a.importProgress.spinner)), completed, total)) + "\n")
+		sb.WriteString("  " + renderProgressBar(completed, total, 32) + "\n")
 		if a.importProgress.current != "" && completed < total {
-			sb.WriteString(styleMuted.Render("  Current: "+a.importProgress.current) + "\n")
+			sb.WriteString(styleMuted.Render("  Importing  ") + styleNormal.Render(a.importProgress.current) + "\n")
 		}
 		if len(a.importProgress.lines) > 0 {
 			sb.WriteString("\n")
@@ -790,29 +797,72 @@ func (a *App) View() string {
 				sb.WriteString("  " + line + "\n")
 			}
 		}
-		sb.WriteString(styleHelp.Render("\n  Please wait  •  ctrl+c quit"))
+		sb.WriteString(renderHelpBar("ctrl+c", "quit"))
 
 	case screenImportVolumeName:
 		sb.WriteString(styleTitle.Render("Volume Name for Import") + "\n\n")
-		sb.WriteString(styleMuted.Render("  File: "+a.importFilePath) + "\n\n")
+		sb.WriteString(styleMuted.Render("  File: ") + styleInfo.Render(a.importFilePath) + "\n\n")
 		sb.WriteString(styleNormal.Render("  Target volume name:") + "\n")
-		sb.WriteString(styleSelected.Render("  > "+a.inputBuffer+"█") + "\n")
-		sb.WriteString(styleHelp.Render("\n  enter confirm  •  esc cancel"))
+		sb.WriteString(styleMuted.Render("  ▸ ") + styleInput.Render(a.inputBuffer) + styleMenuCursor.Render("▌") + "\n")
+		sb.WriteString(renderHelpBar("enter", "confirm", "esc", "cancel"))
 
 	case screenResults:
 		sb.WriteString(styleTitle.Render("Results") + "\n\n")
+		// Summary counts
+		ok, fail := 0, 0
+		for _, line := range a.results {
+			if strings.Contains(line, "✔") {
+				ok++
+			} else if strings.Contains(line, "✗") {
+				fail++
+			}
+		}
+		if ok > 0 || fail > 0 {
+			summary := "  "
+			if ok > 0 {
+				summary += styleSuccess.Render(fmt.Sprintf("✔ %d succeeded", ok))
+			}
+			if fail > 0 {
+				if ok > 0 {
+					summary += "   "
+				}
+				summary += styleError.Render(fmt.Sprintf("✗ %d failed", fail))
+			}
+			sb.WriteString(summary + "\n\n")
+		}
 		for _, line := range a.results {
 			sb.WriteString("  " + line + "\n")
 		}
-		sb.WriteString(styleHelp.Render("\n  Press any key to return to the menu"))
+		sb.WriteString(renderHelpBar("any key", "return to menu"))
 
 	case screenError:
-		sb.WriteString(styleError.Render("Error") + "\n\n")
+		sb.WriteString(styleError.Render("  ✗  Error") + "\n\n")
 		sb.WriteString(styleNormal.Render("  "+a.errMsg) + "\n")
-		sb.WriteString(styleHelp.Render("\n  Press any key to return to the menu"))
+		sb.WriteString(renderHelpBar("any key", "return to menu"))
 	}
 
 	return sb.String()
+}
+
+// renderMenuItem writes a single menu row.
+func renderMenuItem(sb *strings.Builder, idx int, item string, activeIdx int) {
+	if idx == activeIdx {
+		sb.WriteString(styleMenuCursor.Render("  ▸ ") + styleMenuItemActive.Render(item) + "\n")
+	} else {
+		sb.WriteString("    " + styleMenuItem.Render(item) + "\n")
+	}
+}
+
+// renderHelpBar renders a key-description help footer.
+// Pairs are alternating: key, description, key, description, ...
+func renderHelpBar(pairs ...string) string {
+	var parts []string
+	for i := 0; i+1 < len(pairs); i += 2 {
+		key := styleKeyBind.Render(pairs[i])
+		desc := styleKeyDesc.Render(" " + pairs[i+1])
+		parts = append(parts, key+desc)
+	}
+	return styleHelp.Render("\n  " + strings.Join(parts, "   "))
 }
 
 // ---- helpers for SelectableItem adapters ----
@@ -962,7 +1012,7 @@ func resolvePathInput(input string) (string, error) {
 }
 
 func spinnerFrame(index int) string {
-	frames := []string{"|", "/", "-", "\\"}
+	frames := []string{"⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"}
 	return frames[index%len(frames)]
 }
 
@@ -979,8 +1029,9 @@ func renderProgressBar(completed, total, width int) string {
 	if completed > total {
 		completed = total
 	}
-
 	filled := completed * width / total
-	return styleSelected.Render("["+strings.Repeat("=", filled)+strings.Repeat(" ", width-filled)+"]") +
-		styleMuted.Render(fmt.Sprintf(" %d%%", completed*100/total))
+	bar := styleSelected.Render(strings.Repeat("█", filled)) +
+		styleMuted.Render(strings.Repeat("░", width-filled))
+	pct := completed * 100 / total
+	return bar + styleMuted.Render(fmt.Sprintf("  %3d%%", pct))
 }

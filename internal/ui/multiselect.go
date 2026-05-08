@@ -132,23 +132,35 @@ func (m MultiSelectModel) Update(msg tea.Msg) (MultiSelectModel, tea.Cmd) {
 func (m MultiSelectModel) View() string {
 	var sb strings.Builder
 
-	sb.WriteString(styleTitle.Render(m.title))
-	sb.WriteString("\n")
-	position := "0/0"
-	if len(m.items) > 0 {
-		position = fmt.Sprintf("%d/%d", m.cursor+1, len(m.items))
+	// Title
+	sb.WriteString(styleTitle.Render(m.title) + "\n")
+
+	// Stats row
+	selCount := len(m.selected)
+	total := len(m.items)
+	pos := "─"
+	if total > 0 {
+		pos = fmt.Sprintf("%d/%d", m.cursor+1, total)
 	}
-	sb.WriteString(styleMuted.Render(fmt.Sprintf("  %d items  •  %d selected  •  current %s", len(m.items), len(m.selected), position)))
-	sb.WriteString("\n\n")
+	stats := fmt.Sprintf("  %d items", total)
+	if selCount > 0 {
+		stats += fmt.Sprintf("  ·  " + styleSelected.Render(fmt.Sprintf("%d selected", selCount)))
+	}
+	stats += "  ·  " + styleMuted.Render("pos "+pos)
+	sb.WriteString(stats + "\n\n")
 
 	end := m.offset + m.height
-	if end > len(m.items) {
-		end = len(m.items)
+	if end > total {
+		end = total
 	}
 
-	if len(m.items) == 0 {
-		sb.WriteString(styleMuted.Render("  (no items found)"))
-		sb.WriteString("\n")
+	// Scroll-up hint
+	if m.offset > 0 {
+		sb.WriteString(styleMuted.Render(fmt.Sprintf("  ▲ %d more above\n", m.offset)))
+	}
+
+	if total == 0 {
+		sb.WriteString(styleMuted.Render("  (no items found)") + "\n")
 	}
 
 	for i := m.offset; i < end; i++ {
@@ -156,37 +168,40 @@ func (m MultiSelectModel) View() string {
 		_, isSelected := m.selected[i]
 		isActive := i == m.cursor
 
-		cursor := "  "
-		if isActive {
-			cursor = "> "
-		}
-
-		checkbox := "[ ]"
+		// Checkbox glyph
+		check := "○"
 		if isSelected {
-			checkbox = "[x]"
+			check = styleSelected.Render("◉")
 		}
 
-		line := fmt.Sprintf("%s%s %s", cursor, checkbox, item.DisplayName())
-		sub := "    " + item.SubText()
+		// Cursor glyph
+		cur := "  "
 		if isActive {
-			sb.WriteString(styleListItemActive.Render(line) + "\n")
-			sb.WriteString(styleListSubtextActive.Render(sub) + "\n")
-			continue
+			cur = styleCursor.Render("▸ ")
 		}
 
-		if isSelected {
-			sb.WriteString(styleSelected.Render(line) + "\n")
+		mainLine := fmt.Sprintf("%s%s  %s", cur, check, item.DisplayName())
+		subLine := "      " + item.SubText()
+
+		if isActive {
+			sb.WriteString(styleListItemActive.Render(mainLine) + "\n")
+			sb.WriteString(styleListSubtextActive.Render(subLine) + "\n")
+		} else if isSelected {
+			sb.WriteString(styleSelected.Render(mainLine) + "\n")
+			sb.WriteString(styleSubtext.Render(subLine) + "\n")
 		} else {
-			sb.WriteString(styleNormal.Render(line) + "\n")
+			sb.WriteString(styleNormal.Render(mainLine) + "\n")
+			sb.WriteString(styleMuted.Render(subLine) + "\n")
 		}
-		sb.WriteString(styleMuted.Render(sub) + "\n")
 	}
 
-	if len(m.items) > m.height {
-		sb.WriteString(styleMuted.Render(fmt.Sprintf("\n  Showing %d–%d of %d", m.offset+1, end, len(m.items))))
+	// Scroll-down hint
+	below := total - end
+	if below > 0 {
+		sb.WriteString(styleMuted.Render(fmt.Sprintf("  ▼ %d more below\n", below)))
 	}
 
-	sb.WriteString(styleHelp.Render("\n  ↑/↓ navigate  •  pgup/pgdown page  •  space select  •  a select all  •  enter confirm  •  esc cancel"))
+	sb.WriteString(renderHelpBar("↑↓", "navigate", "space", "toggle", "a", "all/none", "enter", "confirm", "esc", "cancel"))
 	return sb.String()
 }
 
