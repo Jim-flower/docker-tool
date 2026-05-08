@@ -228,31 +228,42 @@ func exportSingleVolume(ctx context.Context, cli *client.Client, volName, destDi
 	containerID := resp.ID
 	defer cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
 
+	// Attach BEFORE starting so we get a direct byte stream that bypasses
+	// Docker's log storage (json-file driver encodes binary through JSON and
+	// can corrupt tar data for large or binary-heavy volumes).
+	hijack, err := cli.ContainerAttach(ctx, containerID, container.AttachOptions{
+		Stdout: true,
+		Stream: true,
+	})
+	if err != nil {
+		os.Remove(outPath)
+		return ExportResult{Name: volName, Err: fmt.Errorf("attach container: %w", err)}
+	}
+	defer hijack.Close()
+
 	if err := cli.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
 		os.Remove(outPath)
 		return ExportResult{Name: volName, Err: fmt.Errorf("start container: %w", err)}
 	}
 
+	// Read until the container exits and Docker closes the attached stream.
+	// The attach stream uses the same Docker mux framing as ContainerLogs.
+	if err := stripDockerMux(out, hijack.Reader); err != nil {
+		os.Remove(outPath)
+		return ExportResult{Name: volName, Err: fmt.Errorf("write archive: %w", err)}
+	}
+
+	// ContainerWait is still needed to surface a non-zero exit code from tar.
 	statusCh, errCh := cli.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
 	select {
 	case err := <-errCh:
 		if err != nil {
-			os.Remove(outPath)
 			return ExportResult{Name: volName, Err: fmt.Errorf("wait container: %w", err)}
 		}
-	case <-statusCh:
-	}
-
-	rc, err := cli.ContainerLogs(ctx, containerID, container.LogsOptions{ShowStdout: true, ShowStderr: false})
-	if err != nil {
-		os.Remove(outPath)
-		return ExportResult{Name: volName, Err: fmt.Errorf("container logs: %w", err)}
-	}
-	defer rc.Close()
-
-	if err := stripDockerMux(out, rc); err != nil {
-		os.Remove(outPath)
-		return ExportResult{Name: volName, Err: fmt.Errorf("write archive: %w", err)}
+	case status := <-statusCh:
+		if status.StatusCode != 0 {
+			return ExportResult{Name: volName, Err: fmt.Errorf("tar exited with code %d", status.StatusCode)}
+		}
 	}
 
 	return ExportResult{Name: volName, FilePath: outPath}
