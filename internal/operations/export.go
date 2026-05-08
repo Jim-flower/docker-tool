@@ -215,10 +215,11 @@ func WriteImageImportScript(destDir string, results []ExportResult) (string, err
 	if err := os.WriteFile(scriptPath, []byte(strings.Join(lines, "\n")), 0o755); err != nil {
 		return scriptPath, err
 	}
-	if err := writeImportLauncherScript(destDir); err != nil {
+	launcherPath, err := writeImportLauncherScript(destDir)
+	if err != nil {
 		return scriptPath, err
 	}
-	return scriptPath, nil
+	return launcherPath, nil
 }
 
 // WriteVolumeImportScript writes shell scripts that import exported volume tar files.
@@ -258,13 +259,14 @@ func WriteVolumeImportScript(destDir string, results []ExportResult) (string, er
 	if err := os.WriteFile(scriptPath, []byte(strings.Join(lines, "\n")), 0o755); err != nil {
 		return scriptPath, err
 	}
-	if err := writeImportLauncherScript(destDir); err != nil {
+	launcherPath, err := writeImportLauncherScript(destDir)
+	if err != nil {
 		return scriptPath, err
 	}
-	return scriptPath, nil
+	return launcherPath, nil
 }
 
-func writeImportLauncherScript(destDir string) error {
+func writeImportLauncherScript(destDir string) (string, error) {
 	scriptPath := filepath.Join(destDir, "import.sh")
 	lines := []string{
 		"#!/usr/bin/env sh",
@@ -279,7 +281,7 @@ func writeImportLauncherScript(destDir string) error {
 		`echo "All imports complete."`,
 		"",
 	}
-	return os.WriteFile(scriptPath, []byte(strings.Join(lines, "\n")), 0o755)
+	return scriptPath, os.WriteFile(scriptPath, []byte(strings.Join(lines, "\n")), 0o755)
 }
 
 func shellQuote(value string) string {
