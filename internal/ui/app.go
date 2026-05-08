@@ -93,11 +93,12 @@ type volumeListLoadedMsg struct {
 }
 
 type exportProgressState struct {
-	current   string
-	completed int
-	total     int
-	lines     []string
-	spinner   int
+	current      string
+	completed    int
+	total        int
+	lines        []string
+	spinner      int
+	bytesWritten int64
 }
 
 type exportProgressMsg struct {
@@ -403,10 +404,23 @@ func (a *App) handleExportDest(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (a *App) startExport(destDir string) (tea.Model, tea.Cmd) {
-	progressCh := make(chan operations.ExportProgress)
+	// Buffered so byte-progress bursts from concurrent workers don't stall exports.
+	progressCh := make(chan operations.ExportProgress, 8)
 	a.exportProgressCh = progressCh
 	a.exportProgress = exportProgressState{}
 	a.screen = screenExportProgress
+
+	// IsProgress messages are best-effort; drop rather than block the exporting goroutine.
+	callback := func(progress operations.ExportProgress) {
+		if progress.IsProgress {
+			select {
+			case progressCh <- progress:
+			default:
+			}
+		} else {
+			progressCh <- progress
+		}
+	}
 
 	if a.action == actionExportImages || a.action == actionExportRunningContainerImages {
 		ids := make([]string, len(a.selectedImageIndices))
@@ -417,9 +431,7 @@ func (a *App) startExport(destDir string) (tea.Model, tea.Cmd) {
 		}
 		go func() {
 			defer close(progressCh)
-			operations.ExportImagesWithProgress(context.Background(), a.dc, ids, names, destDir, func(progress operations.ExportProgress) {
-				progressCh <- progress
-			})
+			operations.ExportImagesWithProgress(context.Background(), a.dc, ids, names, destDir, callback)
 		}()
 	} else {
 		names := make([]string, len(a.selectedVolumeIndices))
@@ -428,9 +440,7 @@ func (a *App) startExport(destDir string) (tea.Model, tea.Cmd) {
 		}
 		go func() {
 			defer close(progressCh)
-			operations.ExportVolumesWithProgress(context.Background(), a.dc, names, destDir, func(progress operations.ExportProgress) {
-				progressCh <- progress
-			})
+			operations.ExportVolumesWithProgress(context.Background(), a.dc, names, destDir, callback)
 		}()
 	}
 
@@ -453,6 +463,12 @@ func (a *App) handleExportProgress(msg exportProgressMsg) (tea.Model, tea.Cmd) {
 	}
 
 	progress := msg.progress
+
+	if progress.IsProgress {
+		a.exportProgress.bytesWritten = progress.BytesWritten
+		return a, waitExportProgressCmd(a.exportProgressCh)
+	}
+
 	if progress.Total > 0 {
 		a.exportProgress.total = progress.Total
 	}
@@ -463,6 +479,7 @@ func (a *App) handleExportProgress(msg exportProgressMsg) (tea.Model, tea.Cmd) {
 		a.exportProgress.completed = progress.Index
 	}
 	if progress.HasResult {
+		a.exportProgress.bytesWritten = 0
 		if progress.Result.Err != nil {
 			a.exportProgress.lines = append(a.exportProgress.lines, styleError.Render("✗ "+progress.Result.Name+": "+progress.Result.Err.Error()))
 		} else {
@@ -721,8 +738,17 @@ func (a *App) View() string {
 		}
 		sb.WriteString(styleNormal.Render(fmt.Sprintf("  Working %s  %d/%d complete", spinnerFrame(a.exportProgress.spinner), completed, total)) + "\n")
 		sb.WriteString("  " + renderProgressBar(completed, total, 30) + "\n")
-		if a.exportProgress.current != "" && completed < total {
-			sb.WriteString(styleMuted.Render("  Current: "+a.exportProgress.current) + "\n")
+		if completed < total {
+			if a.exportProgress.bytesWritten > 0 {
+				line := "  Transferring"
+				if a.exportProgress.current != "" {
+					line += " " + a.exportProgress.current
+				}
+				line += "  " + units.HumanSize(float64(a.exportProgress.bytesWritten))
+				sb.WriteString(styleMuted.Render(line) + "\n")
+			} else if a.exportProgress.current != "" {
+				sb.WriteString(styleMuted.Render("  Current: "+a.exportProgress.current) + "\n")
+			}
 		}
 		if len(a.exportProgress.lines) > 0 {
 			sb.WriteString("\n")

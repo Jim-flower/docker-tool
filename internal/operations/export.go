@@ -8,12 +8,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	dockerclient "github.com/jim/dockertool/internal/docker"
 )
+
+const maxConcurrentExports = 3
 
 // ExportResult holds the outcome of a single export operation.
 type ExportResult struct {
@@ -24,14 +27,36 @@ type ExportResult struct {
 
 // ExportProgress reports item-level export progress.
 type ExportProgress struct {
-	Index      int
-	Total      int
-	Name       string
-	Result     ExportResult
-	HasResult  bool
-	ScriptPath string
-	ScriptErr  error
-	Done       bool
+	Index        int
+	Total        int
+	Name         string
+	Result       ExportResult
+	HasResult    bool
+	ScriptPath   string
+	ScriptErr    error
+	Done         bool
+	BytesWritten int64 // non-zero during in-progress byte updates
+	IsProgress   bool  // true = byte-transfer update only, not a completion event
+}
+
+// progressReader wraps a reader and calls onProgress at most every 250 ms.
+type progressReader struct {
+	r          io.Reader
+	written    int64
+	lastReport time.Time
+	onProgress func(int64)
+}
+
+func (pr *progressReader) Read(p []byte) (n int, err error) {
+	n, err = pr.r.Read(p)
+	if n > 0 && pr.onProgress != nil {
+		pr.written += int64(n)
+		if time.Since(pr.lastReport) >= 250*time.Millisecond {
+			pr.lastReport = time.Now()
+			pr.onProgress(pr.written)
+		}
+	}
+	return
 }
 
 // ExportImages saves the selected images as .tar files into destDir.
@@ -39,23 +64,61 @@ func ExportImages(ctx context.Context, dc *dockerclient.Client, imageIDs []strin
 	return ExportImagesWithProgress(ctx, dc, imageIDs, imageNames, destDir, nil)
 }
 
-// ExportImagesWithProgress saves images and reports progress before and after each item.
+// ExportImagesWithProgress exports images concurrently (up to maxConcurrentExports)
+// and reports progress. IsProgress byte-update messages are best-effort.
 func ExportImagesWithProgress(ctx context.Context, dc *dockerclient.Client, imageIDs []string, imageNames []string, destDir string, onProgress func(ExportProgress)) []ExportResult {
-	results := make([]ExportResult, 0, len(imageIDs))
-	cli := dc.Raw()
 	total := len(imageIDs)
+	results := make([]ExportResult, total)
+	cli := dc.Raw()
 
+	type indexedResult struct {
+		index  int
+		result ExportResult
+	}
+
+	resultCh := make(chan indexedResult, total)
+	sem := make(chan struct{}, maxConcurrentExports)
+
+	var wg sync.WaitGroup
 	for i, id := range imageIDs {
-		name := imageNames[i]
+		wg.Add(1)
+		i, id, name := i, id, imageNames[i]
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			var byteProgress func(int64)
+			if onProgress != nil {
+				byteProgress = func(written int64) {
+					onProgress(ExportProgress{
+						Total: total, Name: name,
+						BytesWritten: written, IsProgress: true,
+					})
+				}
+			}
+			result := exportSingleImage(ctx, cli, id, name, destDir, byteProgress)
+			resultCh <- indexedResult{i, result}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	completed := 0
+	for ir := range resultCh {
+		results[ir.index] = ir.result
+		completed++
 		if onProgress != nil {
-			onProgress(ExportProgress{Index: i, Total: total, Name: name})
-		}
-		result := exportSingleImage(ctx, cli, id, name, destDir)
-		results = append(results, result)
-		if onProgress != nil {
-			onProgress(ExportProgress{Index: i + 1, Total: total, Name: name, Result: result, HasResult: true})
+			onProgress(ExportProgress{
+				Index: completed, Total: total,
+				Name: ir.result.Name, Result: ir.result, HasResult: true,
+			})
 		}
 	}
+
 	scriptPath, scriptErr := WriteImageImportScript(destDir, results)
 	if onProgress != nil {
 		onProgress(ExportProgress{Index: total, Total: total, ScriptPath: scriptPath, ScriptErr: scriptErr, Done: true})
@@ -63,7 +126,7 @@ func ExportImagesWithProgress(ctx context.Context, dc *dockerclient.Client, imag
 	return results
 }
 
-func exportSingleImage(ctx context.Context, cli *client.Client, id, name, destDir string) ExportResult {
+func exportSingleImage(ctx context.Context, cli *client.Client, id, name, destDir string, onByteProgress func(int64)) ExportResult {
 	safe := sanitizeFilename(name)
 	outPath := filepath.Join(destDir, safe+".tar")
 
@@ -80,7 +143,12 @@ func exportSingleImage(ctx context.Context, cli *client.Client, id, name, destDi
 	}
 	defer rc.Close()
 
-	if _, err := io.Copy(out, rc); err != nil {
+	var reader io.Reader = rc
+	if onByteProgress != nil {
+		reader = &progressReader{r: rc, onProgress: onByteProgress}
+	}
+
+	if _, err := io.Copy(out, reader); err != nil {
 		os.Remove(outPath)
 		return ExportResult{Name: name, Err: fmt.Errorf("write tar: %w", err)}
 	}
@@ -89,12 +157,14 @@ func exportSingleImage(ctx context.Context, cli *client.Client, id, name, destDi
 }
 
 // ExportVolumes archives the selected volume data as .tar files into destDir.
-// It spins up a temporary Alpine container that mounts the volume and streams a tar archive.
 func ExportVolumes(ctx context.Context, dc *dockerclient.Client, volumeNames []string, destDir string) []ExportResult {
 	return ExportVolumesWithProgress(ctx, dc, volumeNames, destDir, nil)
 }
 
-// ExportVolumesWithProgress archives volumes and reports progress before and after each item.
+// ExportVolumesWithProgress archives volumes and reports progress.
+// It tries the Docker Alpine container method first; on failure it falls back to
+// reading the volume mountpoint directly (needed when Linux containers are
+// unavailable, e.g. Windows containers mode).
 func ExportVolumesWithProgress(ctx context.Context, dc *dockerclient.Client, volumeNames []string, destDir string, onProgress func(ExportProgress)) []ExportResult {
 	results := make([]ExportResult, 0, len(volumeNames))
 	cli := dc.Raw()
@@ -104,7 +174,7 @@ func ExportVolumesWithProgress(ctx context.Context, dc *dockerclient.Client, vol
 		if onProgress != nil {
 			onProgress(ExportProgress{Index: i, Total: total, Name: volName})
 		}
-		result := exportSingleVolume(ctx, cli, volName, destDir)
+		result := exportSingleVolumeWithFallback(ctx, cli, volName, destDir)
 		results = append(results, result)
 		if onProgress != nil {
 			onProgress(ExportProgress{Index: i + 1, Total: total, Name: volName, Result: result, HasResult: true})
@@ -117,6 +187,19 @@ func ExportVolumesWithProgress(ctx context.Context, dc *dockerclient.Client, vol
 	return results
 }
 
+// exportSingleVolumeWithFallback tries the container method first, then direct FS.
+func exportSingleVolumeWithFallback(ctx context.Context, cli *client.Client, volName, destDir string) ExportResult {
+	result := exportSingleVolume(ctx, cli, volName, destDir)
+	if result.Err == nil {
+		return result
+	}
+	direct := exportSingleVolumeDirect(ctx, cli, volName, destDir)
+	if direct.Err == nil {
+		return direct
+	}
+	return result // return original container error
+}
+
 func exportSingleVolume(ctx context.Context, cli *client.Client, volName, destDir string) ExportResult {
 	outPath := filepath.Join(destDir, sanitizeFilename(volName)+".tar")
 
@@ -126,7 +209,6 @@ func exportSingleVolume(ctx context.Context, cli *client.Client, volName, destDi
 	}
 	defer out.Close()
 
-	// Create a temporary container mounting the volume.
 	resp, err := cli.ContainerCreate(ctx,
 		&container.Config{
 			Image: "alpine:latest",
@@ -151,7 +233,6 @@ func exportSingleVolume(ctx context.Context, cli *client.Client, volName, destDi
 		return ExportResult{Name: volName, Err: fmt.Errorf("start container: %w", err)}
 	}
 
-	// Wait for container to finish.
 	statusCh, errCh := cli.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
 	select {
 	case err := <-errCh:
@@ -162,7 +243,6 @@ func exportSingleVolume(ctx context.Context, cli *client.Client, volName, destDi
 	case <-statusCh:
 	}
 
-	// Collect logs (stdout = tar data).
 	rc, err := cli.ContainerLogs(ctx, containerID, container.LogsOptions{ShowStdout: true, ShowStderr: false})
 	if err != nil {
 		os.Remove(outPath)
@@ -170,7 +250,6 @@ func exportSingleVolume(ctx context.Context, cli *client.Client, volName, destDi
 	}
 	defer rc.Close()
 
-	// Docker multiplexes stdout/stderr — strip the 8-byte header.
 	if err := stripDockerMux(out, rc); err != nil {
 		os.Remove(outPath)
 		return ExportResult{Name: volName, Err: fmt.Errorf("write archive: %w", err)}
@@ -179,14 +258,40 @@ func exportSingleVolume(ctx context.Context, cli *client.Client, volName, destDi
 	return ExportResult{Name: volName, FilePath: outPath}
 }
 
-// WriteImageImportScript writes shell scripts that import exported image tar files.
+// exportSingleVolumeDirect reads the volume mountpoint directly without Docker.
+func exportSingleVolumeDirect(ctx context.Context, cli *client.Client, volName, destDir string) ExportResult {
+	vol, err := cli.VolumeInspect(ctx, volName)
+	if err != nil {
+		return ExportResult{Name: volName, Err: fmt.Errorf("inspect volume: %w", err)}
+	}
+
+	outPath := filepath.Join(destDir, sanitizeFilename(volName)+".tar")
+	out, err := os.Create(outPath)
+	if err != nil {
+		return ExportResult{Name: volName, Err: fmt.Errorf("create file: %w", err)}
+	}
+
+	tw := tar.NewWriter(out)
+	if err := addDirToTar(tw, vol.Mountpoint, ""); err != nil {
+		tw.Close()
+		out.Close()
+		os.Remove(outPath)
+		return ExportResult{Name: volName, Err: fmt.Errorf("archive volume: %w", err)}
+	}
+	tw.Close()
+	out.Close()
+	return ExportResult{Name: volName, FilePath: outPath}
+}
+
+// WriteImageImportScript writes import-images.sh with per-item error reporting
+// and a counter that prevents silent failures.
 func WriteImageImportScript(destDir string, results []ExportResult) (string, error) {
 	scriptPath := filepath.Join(destDir, "import-images.sh")
 	lines := []string{
 		"#!/usr/bin/env sh",
-		"set -eu",
 		`SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)`,
 		`command -v docker >/dev/null 2>&1 || { echo "docker is required" >&2; exit 1; }`,
+		`failed=0`,
 		`echo "Importing Docker images..."`,
 	}
 
@@ -201,8 +306,9 @@ func WriteImageImportScript(destDir string, results []ExportResult) (string, err
 		}
 		relPath = filepath.ToSlash(relPath)
 		lines = append(lines,
-			fmt.Sprintf(`echo "Loading image: %s"`, escapeDoubleQuoted(result.Name)),
-			fmt.Sprintf(`docker load -i "$SCRIPT_DIR"/%s`, shellQuote(relPath)),
+			fmt.Sprintf(`echo "Loading: %s"`, escapeDoubleQuoted(result.Name)),
+			fmt.Sprintf(`docker load -i "$SCRIPT_DIR"/%s || { echo "  ERROR: failed to load %s" >&2; failed=$((failed+1)); }`,
+				shellQuote(relPath), escapeDoubleQuoted(result.Name)),
 		)
 		count++
 	}
@@ -210,7 +316,11 @@ func WriteImageImportScript(destDir string, results []ExportResult) (string, err
 	if count == 0 {
 		lines = append(lines, `echo "No image archives found in this export."`)
 	}
-	lines = append(lines, `echo "Image import complete."`, "")
+	lines = append(lines,
+		`[ "$failed" -eq 0 ] || echo "WARNING: $failed image(s) failed to load" >&2`,
+		`echo "Image import complete."`,
+		"",
+	)
 
 	if err := os.WriteFile(scriptPath, []byte(strings.Join(lines, "\n")), 0o755); err != nil {
 		return scriptPath, err
@@ -222,14 +332,14 @@ func WriteImageImportScript(destDir string, results []ExportResult) (string, err
 	return launcherPath, nil
 }
 
-// WriteVolumeImportScript writes shell scripts that import exported volume tar files.
+// WriteVolumeImportScript writes import-volumes.sh with per-item error reporting.
 func WriteVolumeImportScript(destDir string, results []ExportResult) (string, error) {
 	scriptPath := filepath.Join(destDir, "import-volumes.sh")
 	lines := []string{
 		"#!/usr/bin/env sh",
-		"set -eu",
 		`SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)`,
 		`command -v docker >/dev/null 2>&1 || { echo "docker is required" >&2; exit 1; }`,
+		`failed=0`,
 		`echo "Importing Docker volumes..."`,
 	}
 
@@ -245,8 +355,10 @@ func WriteVolumeImportScript(destDir string, results []ExportResult) (string, er
 		relPath = filepath.ToSlash(relPath)
 		lines = append(lines,
 			fmt.Sprintf(`echo "Restoring volume: %s"`, escapeDoubleQuoted(result.Name)),
-			fmt.Sprintf(`docker volume create %s >/dev/null`, shellQuote(result.Name)),
-			fmt.Sprintf(`docker run --rm -i -v %s alpine:latest sh -c 'tar -xf - -C /data' < "$SCRIPT_DIR"/%s`, shellQuote(result.Name+":/data"), shellQuote(relPath)),
+			fmt.Sprintf(`docker volume create %s >/dev/null || { echo "  ERROR: failed to create volume %s" >&2; failed=$((failed+1)); }`,
+				shellQuote(result.Name), escapeDoubleQuoted(result.Name)),
+			fmt.Sprintf(`docker run --rm -i -v %s alpine:latest sh -c 'tar -xf - -C /data' < "$SCRIPT_DIR"/%s || { echo "  ERROR: failed to restore volume %s" >&2; failed=$((failed+1)); }`,
+				shellQuote(result.Name+":/data"), shellQuote(relPath), escapeDoubleQuoted(result.Name)),
 		)
 		count++
 	}
@@ -254,7 +366,11 @@ func WriteVolumeImportScript(destDir string, results []ExportResult) (string, er
 	if count == 0 {
 		lines = append(lines, `echo "No volume archives found in this export."`)
 	}
-	lines = append(lines, `echo "Volume import complete."`, "")
+	lines = append(lines,
+		`[ "$failed" -eq 0 ] || echo "WARNING: $failed item(s) failed to import" >&2`,
+		`echo "Volume import complete."`,
+		"",
+	)
 
 	if err := os.WriteFile(scriptPath, []byte(strings.Join(lines, "\n")), 0o755); err != nil {
 		return scriptPath, err
@@ -270,7 +386,6 @@ func writeImportLauncherScript(destDir string) (string, error) {
 	scriptPath := filepath.Join(destDir, "import.sh")
 	lines := []string{
 		"#!/usr/bin/env sh",
-		"set -eu",
 		`SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)`,
 		`if [ -f "$SCRIPT_DIR/import-images.sh" ]; then`,
 		`  sh "$SCRIPT_DIR/import-images.sh"`,
@@ -310,7 +425,6 @@ func stripDockerMux(w io.Writer, r io.Reader) error {
 		if err != nil {
 			return err
 		}
-		// hdr[0]: stream type (1=stdout, 2=stderr)
 		size := int64(hdr[4])<<24 | int64(hdr[5])<<16 | int64(hdr[6])<<8 | int64(hdr[7])
 		if hdr[0] == 1 {
 			if _, err := io.CopyN(w, r, size); err != nil {
@@ -322,40 +436,6 @@ func stripDockerMux(w io.Writer, r io.Reader) error {
 			}
 		}
 	}
-}
-
-// ExportVolumesDirect archives volume directories directly (Windows-friendly fallback).
-func ExportVolumesDirect(ctx context.Context, dc *dockerclient.Client, volumeNames []string, destDir string) []ExportResult {
-	results := make([]ExportResult, 0, len(volumeNames))
-	cli := dc.Raw()
-
-	for _, volName := range volumeNames {
-		vols, err := cli.VolumeInspect(ctx, volName)
-		if err != nil {
-			results = append(results, ExportResult{Name: volName, Err: fmt.Errorf("inspect volume: %w", err)})
-			continue
-		}
-
-		outPath := filepath.Join(destDir, sanitizeFilename(volName)+".tar")
-		out, err := os.Create(outPath)
-		if err != nil {
-			results = append(results, ExportResult{Name: volName, Err: fmt.Errorf("create file: %w", err)})
-			continue
-		}
-
-		tw := tar.NewWriter(out)
-		if err := addDirToTar(tw, vols.Mountpoint, ""); err != nil {
-			out.Close()
-			os.Remove(outPath)
-			results = append(results, ExportResult{Name: volName, Err: fmt.Errorf("archive volume: %w", err)})
-			continue
-		}
-
-		tw.Close()
-		out.Close()
-		results = append(results, ExportResult{Name: volName, FilePath: outPath})
-	}
-	return results
 }
 
 func addDirToTar(tw *tar.Writer, srcDir, prefix string) error {
