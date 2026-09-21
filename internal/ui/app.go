@@ -29,6 +29,7 @@ const (
 	screenImportFileList
 	screenImportProgress
 	screenImportVolumeName
+	screenComposeFile
 	screenResults
 	screenError
 )
@@ -40,6 +41,7 @@ const (
 	actionNone action = iota
 	actionExportImages
 	actionExportRunningContainerImages
+	actionExportComposeImages
 	actionExportVolumes
 	actionImportImages
 	actionImportVolumes
@@ -68,6 +70,7 @@ type App struct {
 	selectedTarFileIndices []int
 	importFilePath         string
 	results                []string
+	composeWarnings        []string
 	errMsg                 string
 	loadingMsg             string
 	exportProgress         exportProgressState
@@ -124,6 +127,7 @@ type importSpinnerTickMsg struct{}
 var menuItems = []string{
 	"Export Images",
 	"Export Running Container Images",
+	"Export Images from Compose File",
 	"Export Volumes",
 	"Import Images",
 	"Import Volumes",
@@ -199,6 +203,8 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case screenImportVolumeName:
 		return a.handleImportVolumeName(msg)
+	case screenComposeFile:
+		return a.handleComposeFile(msg)
 	case screenResults, screenError:
 		a.screen = screenMenu
 	}
@@ -239,23 +245,30 @@ func (a *App) activateMenuItem() (tea.Model, tea.Cmd) {
 		a.screen = screenLoading
 		return a, loadRunningContainerImagesCmd(a.dc)
 
-	case 2: // Export Volumes
+	case 2: // Export Images from Compose File
+		a.filePicker = NewFilePicker(defaultFilePickerDir(), ".yml,.yaml", listHeight(a.windowHeight), pickerModeFile)
+		a.filePicker.Title = "Select Compose File"
+		a.action = actionExportComposeImages
+		a.composeWarnings = nil
+		a.screen = screenComposeFile
+
+	case 3: // Export Volumes
 		a.action = actionExportVolumes
 		a.loadingMsg = "Loading Docker volumes..."
 		a.screen = screenLoading
 		return a, loadVolumesCmd(a.dc)
 
-	case 3: // Import Images
+	case 4: // Import Images
 		a.filePicker = NewFilePicker(defaultFilePickerDir(), ".tar", listHeight(a.windowHeight), pickerModeDirectory)
 		a.action = actionImportImages
 		a.screen = screenImportFile
 
-	case 4: // Import Volumes
+	case 5: // Import Volumes
 		a.filePicker = NewFilePicker(defaultFilePickerDir(), ".tar", listHeight(a.windowHeight), pickerModeDirectory)
 		a.action = actionImportVolumes
 		a.screen = screenImportFile
 
-	case 5: // Quit
+	case 6: // Quit
 		return a, tea.Quit
 	}
 	return a, nil
@@ -355,7 +368,7 @@ func (a *App) handleList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		sort.Ints(indices)
 
-		if a.action == actionExportImages || a.action == actionExportRunningContainerImages {
+		if a.action == actionExportImages || a.action == actionExportRunningContainerImages || a.action == actionExportComposeImages {
 			a.selectedImageIndices = indices
 		} else {
 			a.selectedVolumeIndices = indices
@@ -422,7 +435,7 @@ func (a *App) startExport(destDir string) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	if a.action == actionExportImages || a.action == actionExportRunningContainerImages {
+	if a.action == actionExportImages || a.action == actionExportRunningContainerImages || a.action == actionExportComposeImages {
 		ids := make([]string, len(a.selectedImageIndices))
 		names := make([]string, len(a.selectedImageIndices))
 		for i, idx := range a.selectedImageIndices {
@@ -493,6 +506,9 @@ func (a *App) handleExportProgress(msg exportProgressMsg) (tea.Model, tea.Cmd) {
 			a.exportProgress.lines = append(a.exportProgress.lines, styleSuccess.Render("✔ Import script → "+progress.ScriptPath))
 		}
 		a.results = a.exportProgress.lines
+		if a.action == actionExportComposeImages && len(a.composeWarnings) > 0 {
+			a.results = append(append([]string{}, a.composeWarnings...), a.results...)
+		}
 		a.screen = screenResults
 		return a, nil
 	}
@@ -512,6 +528,54 @@ func (a *App) handleExportSpinnerTick() (tea.Model, tea.Cmd) {
 	}
 	a.exportProgress.spinner++
 	return a, exportSpinnerTickCmd()
+}
+
+// ---- Compose file picker ----
+
+func (a *App) handleComposeFile(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	updated, cmd := a.filePicker.Update(msg)
+	a.filePicker = updated
+
+	if a.filePicker.IsCanceled() {
+		a.screen = screenMenu
+		return a, nil
+	}
+
+	if a.filePicker.IsChosen() {
+		path := a.filePicker.Chosen()
+		refs, err := dockerclient.ParseComposeImages(path)
+		if err != nil {
+			a.errMsg = err.Error()
+			a.screen = screenError
+			return a, nil
+		}
+		matched, missing, err := a.dc.MatchImagesByRef(context.Background(), refs)
+		if err != nil {
+			a.errMsg = "Cannot list local images: " + err.Error()
+			a.screen = screenError
+			return a, nil
+		}
+		if len(matched) == 0 {
+			a.errMsg = "None of the compose file's images exist locally. Pull them first (docker compose pull)."
+			a.screen = screenError
+			return a, nil
+		}
+
+		a.composeWarnings = nil
+		for _, ref := range missing {
+			a.composeWarnings = append(a.composeWarnings, styleMuted.Render("⚠ "+ref+" not found locally, skipped"))
+		}
+
+		a.images = matched
+		items := make([]SelectableItem, len(matched))
+		for i, img := range matched {
+			items[i] = imageItem{img}
+		}
+		a.multiSelect = NewMultiSelect("Select Compose Images to Export", items, listHeight(a.windowHeight)).SelectAll()
+		a.screen = screenImageList
+	}
+
+	return a, cmd
 }
 
 // ---- Import file picker ----
@@ -706,17 +770,17 @@ func (a *App) View() string {
 	case screenMenu:
 		// Export group
 		sb.WriteString(styleSectionLabel.Render("  EXPORT") + "\n")
-		for i := 0; i <= 2; i++ {
+		for i := 0; i <= 3; i++ {
 			renderMenuItem(&sb, i, menuItems[i], a.menuIdx)
 		}
 		sb.WriteString("\n")
 		// Import group
 		sb.WriteString(styleSectionLabel.Render("  IMPORT") + "\n")
-		for i := 3; i <= 4; i++ {
+		for i := 4; i <= 5; i++ {
 			renderMenuItem(&sb, i, menuItems[i], a.menuIdx)
 		}
 		sb.WriteString("\n" + styleDivider.Render("  "+strings.Repeat("─", 32)) + "\n")
-		renderMenuItem(&sb, 5, menuItems[5], a.menuIdx)
+		renderMenuItem(&sb, 6, menuItems[6], a.menuIdx)
 		sb.WriteString(renderHelpBar("↑↓", "navigate", "enter", "select", "q", "quit"))
 
 	case screenLoading:
@@ -805,6 +869,9 @@ func (a *App) View() string {
 		sb.WriteString(styleNormal.Render("  Target volume name:") + "\n")
 		sb.WriteString(styleMuted.Render("  ▸ ") + styleInput.Render(a.inputBuffer) + styleMenuCursor.Render("▌") + "\n")
 		sb.WriteString(renderHelpBar("enter", "confirm", "esc", "cancel"))
+
+	case screenComposeFile:
+		sb.WriteString(a.filePicker.View())
 
 	case screenResults:
 		sb.WriteString(styleTitle.Render("Results") + "\n\n")

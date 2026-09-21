@@ -29,6 +29,8 @@ type FilePicker struct {
 	filter     string
 	err        error
 	mode       pickerMode
+	// Title optionally overrides the default header text.
+	Title string
 }
 
 func NewFilePicker(startDir, filter string, visibleHeight int, mode ...pickerMode) FilePicker {
@@ -116,9 +118,12 @@ func (fp FilePicker) View() string {
 	var sb strings.Builder
 
 	// Title
-	title := "Select File"
-	if fp.mode == pickerModeDirectory {
-		title = "Select Export Folder"
+	title := fp.Title
+	if title == "" {
+		title = "Select File"
+		if fp.mode == pickerModeDirectory {
+			title = "Select Export Folder"
+		}
 	}
 	sb.WriteString(styleTitle.Render(title) + "\n")
 
@@ -204,6 +209,21 @@ func (fp FilePicker) selectedDir() string {
 	return filepath.Join(fp.currentDir, entry.Name())
 }
 
+// matchesFilter reports whether name matches any of the comma-separated
+// suffixes in filter (case-insensitive). An empty filter matches everything.
+func matchesFilter(name, filter string) bool {
+	if filter == "" {
+		return true
+	}
+	for _, suffix := range strings.Split(filter, ",") {
+		suffix = strings.TrimSpace(suffix)
+		if suffix != "" && strings.HasSuffix(strings.ToLower(name), strings.ToLower(suffix)) {
+			return true
+		}
+	}
+	return false
+}
+
 func readDir(dir, filter string) ([]os.DirEntry, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -211,7 +231,7 @@ func readDir(dir, filter string) ([]os.DirEntry, error) {
 	}
 	filtered := entries[:0]
 	for _, e := range entries {
-		if e.IsDir() || filter == "" || strings.HasSuffix(strings.ToLower(e.Name()), strings.ToLower(filter)) {
+		if e.IsDir() || matchesFilter(e.Name(), filter) {
 			filtered = append(filtered, e)
 		}
 	}
