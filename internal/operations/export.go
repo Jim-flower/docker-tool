@@ -136,7 +136,19 @@ func exportSingleImage(ctx context.Context, cli *client.Client, id, name, destDi
 	}
 	defer out.Close()
 
-	rc, err := cli.ImageSave(ctx, []string{id})
+	// Save by the repo:tag reference when available so tag metadata
+	// (RepoTags in manifest.json) is preserved in the archive.
+	// Saving by image ID alone produces tars with no tags, so the
+	// image imports as <none>:<none>.
+	ref := id
+	if strings.Contains(name, ":") {
+		ref = name
+	}
+	rc, err := cli.ImageSave(ctx, []string{ref})
+	if err != nil && ref != id {
+		// The tag may have been removed after listing; fall back to ID.
+		rc, err = cli.ImageSave(ctx, []string{id})
+	}
 	if err != nil {
 		os.Remove(outPath)
 		return ExportResult{Name: name, Err: fmt.Errorf("docker image save: %w", err)}
