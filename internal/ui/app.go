@@ -87,7 +87,7 @@ type imageListLoadedMsg struct {
 	err          error
 	sourceAction action
 	title        string
-	selectAll    bool
+	preselect    []int
 }
 
 type volumeListLoadedMsg struct {
@@ -288,13 +288,44 @@ func loadImagesCmd(dc *dockerclient.Client) tea.Cmd {
 
 func loadRunningContainerImagesCmd(dc *dockerclient.Client) tea.Cmd {
 	return func() tea.Msg {
-		imgs, err := dc.ListRunningContainerImages(context.Background())
+		fail := func(err error) imageListLoadedMsg {
+			return imageListLoadedMsg{err: err, sourceAction: actionExportRunningContainerImages}
+		}
+		running, err := dc.ListRunningContainerImages(context.Background())
+		if err != nil {
+			return fail(err)
+		}
+		all, err := dc.ListImages(context.Background())
+		if err != nil {
+			return fail(err)
+		}
+
+		runningIDs := make(map[string]struct{}, len(running))
+		for _, img := range running {
+			runningIDs[img.ID] = struct{}{}
+		}
+		rest := make([]dockerclient.Image, 0, len(all)-len(running))
+		for _, img := range all {
+			if _, ok := runningIDs[img.ID]; !ok {
+				rest = append(rest, img)
+			}
+		}
+		sort.Slice(rest, func(i, j int) bool {
+			return rest[i].DisplayName() < rest[j].DisplayName()
+		})
+
+		// Running container images come first and are pre-selected; the user
+		// can additionally pick any other local image from the same list.
+		images := append(append([]dockerclient.Image{}, running...), rest...)
+		preselect := make([]int, len(running))
+		for i := range running {
+			preselect[i] = i
+		}
 		return imageListLoadedMsg{
-			images:       imgs,
-			err:          err,
+			images:       images,
 			sourceAction: actionExportRunningContainerImages,
-			title:        "Select Running Container Images to Export",
-			selectAll:    true,
+			title:        "Select Images to Export (running containers pre-selected)",
+			preselect:    preselect,
 		}
 	}
 }
@@ -316,13 +347,21 @@ func (a *App) handleImageListLoaded(msg imageListLoadedMsg) (tea.Model, tea.Cmd)
 		return a, nil
 	}
 	a.images = msg.images
+	preselected := make(map[int]struct{}, len(msg.preselect))
+	for _, idx := range msg.preselect {
+		preselected[idx] = struct{}{}
+	}
 	items := make([]SelectableItem, len(msg.images))
 	for i, img := range msg.images {
-		items[i] = imageItem{img}
+		item := imageItem{img: img}
+		if _, ok := preselected[i]; ok {
+			item.badge = "● running"
+		}
+		items[i] = item
 	}
 	a.multiSelect = NewMultiSelect(msg.title, items, listHeight(a.windowHeight))
-	if msg.selectAll {
-		a.multiSelect = a.multiSelect.SelectAll()
+	if len(msg.preselect) > 0 {
+		a.multiSelect = a.multiSelect.Select(msg.preselect...)
 	}
 	a.action = msg.sourceAction
 	a.screen = screenImageList
@@ -569,7 +608,7 @@ func (a *App) handleComposeFile(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.images = matched
 		items := make([]SelectableItem, len(matched))
 		for i, img := range matched {
-			items[i] = imageItem{img}
+			items[i] = imageItem{img: img}
 		}
 		a.multiSelect = NewMultiSelect("Select Compose Images to Export", items, listHeight(a.windowHeight)).SelectAll()
 		a.screen = screenImageList
@@ -934,11 +973,18 @@ func renderHelpBar(pairs ...string) string {
 
 // ---- helpers for SelectableItem adapters ----
 
-type imageItem struct{ img dockerclient.Image }
+type imageItem struct {
+	img   dockerclient.Image
+	badge string
+}
 
 func (i imageItem) DisplayName() string { return i.img.DisplayName() }
 func (i imageItem) SubText() string {
-	return fmt.Sprintf("ID: %s  Size: %s", i.img.ShortID, units.HumanSize(float64(i.img.Size)))
+	s := fmt.Sprintf("ID: %s  Size: %s", i.img.ShortID, units.HumanSize(float64(i.img.Size)))
+	if i.badge != "" {
+		return i.badge + "  " + s
+	}
+	return s
 }
 
 type volumeItem struct{ vol dockerclient.Volume }
