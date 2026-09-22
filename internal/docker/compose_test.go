@@ -86,6 +86,94 @@ services:
 	}
 }
 
+func TestParseComposeVolumes(t *testing.T) {
+	path := writeCompose(t, `
+services:
+  db:
+    image: postgres:16
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./localdir:/config
+      - /abs/path:/abs
+      - ~/home/path:/home
+  web:
+    image: nginx
+    volumes:
+      - type: volume
+        source: assets
+        target: /usr/share/nginx/html
+      - type: bind
+        source: ./static
+        target: /static
+      - type: volume
+        source: pgdata
+        target: /backup
+volumes:
+  pgdata:
+  assets:
+    name: custom-assets
+`)
+	got, err := ParseComposeVolumes(path)
+	if err != nil {
+		t.Fatalf("ParseComposeVolumes: %v", err)
+	}
+	want := []string{"custom-assets", "pgdata"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestParseComposeVolumesWindowsPaths(t *testing.T) {
+	path := writeCompose(t, `
+services:
+  app:
+    image: app
+    volumes:
+      - C:\\data:/data
+      - cache:/cache
+`)
+	got, err := ParseComposeVolumes(path)
+	if err != nil {
+		t.Fatalf("ParseComposeVolumes: %v", err)
+	}
+	want := []string{"cache"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestParseComposeVolumesEnvInterpolation(t *testing.T) {
+	t.Setenv("VOL_SUFFIX", "prod")
+	path := writeCompose(t, `
+services:
+  app:
+    image: app
+    volumes:
+      - data-${VOL_SUFFIX}:/data
+`)
+	got, err := ParseComposeVolumes(path)
+	if err != nil {
+		t.Fatalf("ParseComposeVolumes: %v", err)
+	}
+	want := []string{"data-prod"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestParseComposeVolumesNone(t *testing.T) {
+	path := writeCompose(t, `
+services:
+  app:
+    image: app
+    volumes:
+      - ./config:/config
+`)
+	if _, err := ParseComposeVolumes(path); err == nil {
+		t.Fatal("expected error when no named volumes exist")
+	}
+}
+
 func TestParseComposeImagesInvalidYAML(t *testing.T) {
 	path := writeCompose(t, "services: [unclosed")
 	if _, err := ParseComposeImages(path); err == nil {

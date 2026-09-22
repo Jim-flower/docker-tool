@@ -43,6 +43,7 @@ const (
 	actionExportRunningContainerImages
 	actionExportComposeImages
 	actionExportVolumes
+	actionExportComposeVolumes
 	actionImportImages
 	actionImportVolumes
 )
@@ -129,6 +130,7 @@ var menuItems = []string{
 	"Export Running Container Images",
 	"Export Images from Compose File",
 	"Export Volumes",
+	"Export Volumes from Compose File",
 	"Import Images",
 	"Import Volumes",
 	"Quit",
@@ -139,6 +141,7 @@ var menuIcons = []string{
 	"▶", // Export Running Container Images
 	"🧩", // Export Images from Compose File
 	"🗄", // Export Volumes
+	"🗃", // Export Volumes from Compose File
 	"📥", // Import Images
 	"📥", // Import Volumes
 	"🚪", // Quit
@@ -268,17 +271,24 @@ func (a *App) activateMenuItem() (tea.Model, tea.Cmd) {
 		a.screen = screenLoading
 		return a, loadVolumesCmd(a.dc)
 
-	case 4: // Import Images
+	case 4: // Export Volumes from Compose File
+		a.filePicker = NewFilePicker(defaultFilePickerDir(), ".yml,.yaml", listHeight(a.windowHeight), pickerModeFile)
+		a.filePicker.Title = "Select Compose File"
+		a.action = actionExportComposeVolumes
+		a.composeWarnings = nil
+		a.screen = screenComposeFile
+
+	case 5: // Import Images
 		a.filePicker = NewFilePicker(defaultFilePickerDir(), ".tar", listHeight(a.windowHeight), pickerModeDirectory)
 		a.action = actionImportImages
 		a.screen = screenImportFile
 
-	case 5: // Import Volumes
+	case 6: // Import Volumes
 		a.filePicker = NewFilePicker(defaultFilePickerDir(), ".tar", listHeight(a.windowHeight), pickerModeDirectory)
 		a.action = actionImportVolumes
 		a.screen = screenImportFile
 
-	case 6: // Quit
+	case 7: // Quit
 		return a, tea.Quit
 	}
 	return a, nil
@@ -555,7 +565,8 @@ func (a *App) handleExportProgress(msg exportProgressMsg) (tea.Model, tea.Cmd) {
 			a.exportProgress.lines = append(a.exportProgress.lines, styleSuccess.Render("✔ Import script → "+progress.ScriptPath))
 		}
 		a.results = a.exportProgress.lines
-		if a.action == actionExportComposeImages && len(a.composeWarnings) > 0 {
+		isComposeExport := a.action == actionExportComposeImages || a.action == actionExportComposeVolumes
+		if isComposeExport && len(a.composeWarnings) > 0 {
 			a.results = append(append([]string{}, a.composeWarnings...), a.results...)
 		}
 		a.screen = screenResults
@@ -590,41 +601,83 @@ func (a *App) handleComposeFile(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
-	if a.filePicker.IsChosen() {
-		path := a.filePicker.Chosen()
-		refs, err := dockerclient.ParseComposeImages(path)
-		if err != nil {
-			a.errMsg = err.Error()
-			a.screen = screenError
-			return a, nil
-		}
-		matched, missing, err := a.dc.MatchImagesByRef(context.Background(), refs)
-		if err != nil {
-			a.errMsg = "Cannot list local images: " + err.Error()
-			a.screen = screenError
-			return a, nil
-		}
-		if len(matched) == 0 {
-			a.errMsg = "None of the compose file's images exist locally. Pull them first (docker compose pull)."
-			a.screen = screenError
-			return a, nil
-		}
-
-		a.composeWarnings = nil
-		for _, ref := range missing {
-			a.composeWarnings = append(a.composeWarnings, styleMuted.Render("⚠ "+ref+" not found locally, skipped"))
-		}
-
-		a.images = matched
-		items := make([]SelectableItem, len(matched))
-		for i, img := range matched {
-			items[i] = imageItem{img: img}
-		}
-		a.multiSelect = NewMultiSelect("Select Compose Images to Export", items, listHeight(a.windowHeight)).SelectAll()
-		a.screen = screenImageList
+	if !a.filePicker.IsChosen() {
+		return a, cmd
 	}
 
-	return a, cmd
+	path := a.filePicker.Chosen()
+	if a.action == actionExportComposeVolumes {
+		return a.loadComposeVolumes(path)
+	}
+	return a.loadComposeImages(path)
+}
+
+func (a *App) loadComposeImages(path string) (tea.Model, tea.Cmd) {
+	refs, err := dockerclient.ParseComposeImages(path)
+	if err != nil {
+		a.errMsg = err.Error()
+		a.screen = screenError
+		return a, nil
+	}
+	matched, missing, err := a.dc.MatchImagesByRef(context.Background(), refs)
+	if err != nil {
+		a.errMsg = "Cannot list local images: " + err.Error()
+		a.screen = screenError
+		return a, nil
+	}
+	if len(matched) == 0 {
+		a.errMsg = "None of the compose file's images exist locally. Pull them first (docker compose pull)."
+		a.screen = screenError
+		return a, nil
+	}
+
+	a.composeWarnings = nil
+	for _, ref := range missing {
+		a.composeWarnings = append(a.composeWarnings, styleMuted.Render("⚠ "+ref+" not found locally, skipped"))
+	}
+
+	a.images = matched
+	items := make([]SelectableItem, len(matched))
+	for i, img := range matched {
+		items[i] = imageItem{img: img}
+	}
+	a.multiSelect = NewMultiSelect("Select Compose Images to Export", items, listHeight(a.windowHeight)).SelectAll()
+	a.screen = screenImageList
+	return a, nil
+}
+
+func (a *App) loadComposeVolumes(path string) (tea.Model, tea.Cmd) {
+	names, err := dockerclient.ParseComposeVolumes(path)
+	if err != nil {
+		a.errMsg = err.Error()
+		a.screen = screenError
+		return a, nil
+	}
+	matched, missing, err := a.dc.MatchVolumesByName(context.Background(), names)
+	if err != nil {
+		a.errMsg = "Cannot list local volumes: " + err.Error()
+		a.screen = screenError
+		return a, nil
+	}
+	if len(matched) == 0 {
+		a.errMsg = "None of the compose file's named volumes exist locally."
+		a.screen = screenError
+		return a, nil
+	}
+
+	a.composeWarnings = nil
+	for _, name := range missing {
+		a.composeWarnings = append(a.composeWarnings, styleMuted.Render("⚠ volume "+name+" not found locally, skipped"))
+	}
+
+	a.volumes = matched
+	items := make([]SelectableItem, len(matched))
+	for i, v := range matched {
+		items[i] = volumeItem{v}
+	}
+	a.multiSelect = NewMultiSelect("Select Compose Volumes to Export", items, listHeight(a.windowHeight)).SelectAll()
+	a.screen = screenVolumeList
+	return a, nil
 }
 
 // ---- Import file picker ----
@@ -819,17 +872,17 @@ func (a *App) View() string {
 	case screenMenu:
 		// Export group
 		sb.WriteString(styleSectionLabel.Render("  EXPORT") + "\n")
-		for i := 0; i <= 3; i++ {
+		for i := 0; i <= 4; i++ {
 			renderMenuItem(&sb, i, menuIcons[i]+"  "+menuItems[i], a.menuIdx)
 		}
 		sb.WriteString("\n")
 		// Import group
 		sb.WriteString(styleSectionLabel.Render("  IMPORT") + "\n")
-		for i := 4; i <= 5; i++ {
+		for i := 5; i <= 6; i++ {
 			renderMenuItem(&sb, i, menuIcons[i]+"  "+menuItems[i], a.menuIdx)
 		}
 		sb.WriteString("\n" + styleDivider.Render("  "+strings.Repeat("─", 32)) + "\n")
-		renderMenuItem(&sb, 6, menuIcons[6]+"  "+menuItems[6], a.menuIdx)
+		renderMenuItem(&sb, 7, menuIcons[7]+"  "+menuItems[7], a.menuIdx)
 		sb.WriteString(renderHelpBar("↑↓", "navigate", "enter", "select", "q", "quit"))
 
 	case screenLoading:
