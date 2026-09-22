@@ -95,6 +95,29 @@ func TestMultiSelectSelectAllFiltered(t *testing.T) {
 	}
 }
 
+func TestMultiSelectSearchBackspace(t *testing.T) {
+	m := newTestMultiSelect("nginx:1.27", "postgres:16")
+	m, _ = m.Update(key("/"))
+	for _, r := range "ngi" {
+		m, _ = m.Update(key(string(r)))
+	}
+	if m.filter != "ngi" {
+		t.Fatalf("filter = %q, want %q", m.filter, "ngi")
+	}
+
+	// Regular backspace deletes one char.
+	m, _ = m.Update(key("backspace"))
+	if m.filter != "ng" {
+		t.Fatalf("filter = %q, want %q after backspace", m.filter, "ng")
+	}
+
+	// Ctrl+H (Windows terminals send 0x08 for Backspace) must also delete.
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlH})
+	if m.filter != "n" {
+		t.Fatalf("filter = %q, want %q after ctrl+h", m.filter, "n")
+	}
+}
+
 func TestMultiSelectSelect(t *testing.T) {
 	m := newTestMultiSelect("a", "b", "c").Select(0, 2)
 	got := m.SelectedIndices()

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // SelectableItem is any item that can appear in a multi-select list.
@@ -94,7 +95,8 @@ func (m MultiSelectModel) updateSearch(key tea.KeyMsg) MultiSelectModel {
 	case tea.KeyEsc:
 		m.searching = false
 		m = m.setFilter("")
-	case tea.KeyBackspace:
+	case tea.KeyBackspace, tea.KeyCtrlH:
+		// Ctrl+H: some terminals (notably Windows) send 0x08 for Backspace.
 		runes := []rune(m.filter)
 		if len(runes) > 0 {
 			m = m.setFilter(string(runes[:len(runes)-1]))
@@ -239,7 +241,11 @@ func (m MultiSelectModel) View() string {
 
 	// Filter row
 	if m.searching || m.filter != "" {
-		filterLine := styleMuted.Render("  Filter: ") + styleInput.Render(m.filter)
+		icon := styleMuted.Render("🔍 ")
+		if m.searching {
+			icon = styleSearchIcon.Render("🔍 ")
+		}
+		filterLine := "  " + icon + styleInput.Render(m.filter)
 		if m.searching {
 			filterLine += styleMenuCursor.Render("▌")
 		}
@@ -258,7 +264,11 @@ func (m MultiSelectModel) View() string {
 	}
 
 	if total == 0 {
-		sb.WriteString(styleMuted.Render("  (no items found)") + "\n")
+		if m.filter != "" {
+			sb.WriteString(styleMuted.Render("  (no matches for ") + styleInput.Render(m.filter) + styleMuted.Render(")") + "\n")
+		} else {
+			sb.WriteString(styleMuted.Render("  (no items found)") + "\n")
+		}
 	}
 
 	for row := m.offset; row < end; row++ {
@@ -270,26 +280,28 @@ func (m MultiSelectModel) View() string {
 		// Checkbox glyph
 		check := "○"
 		if isSelected {
-			check = styleSelected.Render("◉")
+			check = "◉"
 		}
 
 		// Cursor glyph
 		cur := "  "
 		if isActive {
-			cur = styleCursor.Render("▸ ")
+			cur = "▸ "
 		}
 
-		mainLine := fmt.Sprintf("%s%s  %s", cur, check, item.DisplayName())
+		prefix := cur + check + "  "
+		name := item.DisplayName()
 		subLine := "      " + item.SubText()
 
-		if isActive {
-			sb.WriteString(styleListItemActive.Render(mainLine) + "\n")
+		switch {
+		case isActive:
+			sb.WriteString(styleListItemActive.Render(prefix+name) + "\n")
 			sb.WriteString(styleListSubtextActive.Render(subLine) + "\n")
-		} else if isSelected {
-			sb.WriteString(styleSelected.Render(mainLine) + "\n")
+		case isSelected:
+			sb.WriteString(styleSelected.Render(prefix) + renderFilteredName(name, m.filter, styleSelected) + "\n")
 			sb.WriteString(styleSubtext.Render(subLine) + "\n")
-		} else {
-			sb.WriteString(styleNormal.Render(mainLine) + "\n")
+		default:
+			sb.WriteString(styleNormal.Render(prefix) + renderFilteredName(name, m.filter, styleNormal) + "\n")
 			sb.WriteString(styleMuted.Render(subLine) + "\n")
 		}
 	}
@@ -306,6 +318,21 @@ func (m MultiSelectModel) View() string {
 		sb.WriteString(renderHelpBar("↑↓", "navigate", "space", "toggle", "a", "all/none", "/", "search", "enter", "confirm", "esc", "cancel"))
 	}
 	return sb.String()
+}
+
+// renderFilteredName renders name with the first case-insensitive occurrence
+// of filter highlighted using styleMatch; the rest uses base.
+func renderFilteredName(name, filter string, base lipgloss.Style) string {
+	if filter == "" {
+		return base.Render(name)
+	}
+	idx := strings.Index(strings.ToLower(name), strings.ToLower(filter))
+	if idx < 0 {
+		return base.Render(name)
+	}
+	return base.Render(name[:idx]) +
+		styleMatch.Render(name[idx:idx+len(filter)]) +
+		base.Render(name[idx+len(filter):])
 }
 
 // SelectedIndices returns the indices of all selected items.

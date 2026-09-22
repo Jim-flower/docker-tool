@@ -107,6 +107,17 @@ var (
 			Foreground(colorSecondary).
 			Bold(true)
 
+	// Highlight for the matched portion of a name while filtering
+	styleMatch = lipgloss.NewStyle().
+			Foreground(colorSelected).
+			Bold(true).
+			Underline(true)
+
+	// Search prompt icon while the search input is active
+	styleSearchIcon = lipgloss.NewStyle().
+			Foreground(colorPrimary).
+			Bold(true)
+
 	styleBox = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(colorPrimary).

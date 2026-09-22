@@ -134,6 +134,16 @@ var menuItems = []string{
 	"Quit",
 }
 
+var menuIcons = []string{
+	"📦", // Export Images
+	"▶", // Export Running Container Images
+	"🧩", // Export Images from Compose File
+	"🗄", // Export Volumes
+	"📥", // Import Images
+	"📥", // Import Volumes
+	"🚪", // Quit
+}
+
 // NewApp creates and initialises the App model.
 func NewApp(dc *dockerclient.Client) *App {
 	return &App{dc: dc, screen: screenMenu}
@@ -784,7 +794,7 @@ func (a *App) handleImportVolumeName(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.screen = screenResults
 	case "esc":
 		a.screen = screenMenu
-	case "backspace":
+	case "backspace", "ctrl+h":
 		if len(a.inputBuffer) > 0 {
 			a.inputBuffer = a.inputBuffer[:len(a.inputBuffer)-1]
 		}
@@ -810,16 +820,16 @@ func (a *App) View() string {
 		// Export group
 		sb.WriteString(styleSectionLabel.Render("  EXPORT") + "\n")
 		for i := 0; i <= 3; i++ {
-			renderMenuItem(&sb, i, menuItems[i], a.menuIdx)
+			renderMenuItem(&sb, i, menuIcons[i]+"  "+menuItems[i], a.menuIdx)
 		}
 		sb.WriteString("\n")
 		// Import group
 		sb.WriteString(styleSectionLabel.Render("  IMPORT") + "\n")
 		for i := 4; i <= 5; i++ {
-			renderMenuItem(&sb, i, menuItems[i], a.menuIdx)
+			renderMenuItem(&sb, i, menuIcons[i]+"  "+menuItems[i], a.menuIdx)
 		}
 		sb.WriteString("\n" + styleDivider.Render("  "+strings.Repeat("─", 32)) + "\n")
-		renderMenuItem(&sb, 6, menuItems[6], a.menuIdx)
+		renderMenuItem(&sb, 6, menuIcons[6]+"  "+menuItems[6], a.menuIdx)
 		sb.WriteString(renderHelpBar("↑↓", "navigate", "enter", "select", "q", "quit"))
 
 	case screenLoading:
