@@ -23,13 +23,17 @@ const (
 	screenLoading
 	screenImageList
 	screenVolumeList
+	screenContainerList
 	screenExportDest
+	screenExportMode
 	screenExportProgress
 	screenImportFile
 	screenImportFileList
 	screenImportProgress
 	screenImportVolumeName
 	screenComposeFile
+	screenConfirm
+	screenRemoveProgress
 	screenResults
 	screenError
 )
@@ -46,7 +50,21 @@ const (
 	actionExportComposeVolumes
 	actionImportImages
 	actionImportVolumes
+	actionRemoveImages
+	actionRemoveVolumes
+	actionRemoveContainers
 )
+
+// isImageExport reports whether the action exports images (and therefore reads
+// the image selection).
+func (a action) isImageExport() bool {
+	return a == actionExportImages || a == actionExportRunningContainerImages || a == actionExportComposeImages
+}
+
+// isRemove reports whether the action deletes Docker objects.
+func (a action) isRemove() bool {
+	return a == actionRemoveImages || a == actionRemoveVolumes || a == actionRemoveContainers
+}
 
 // App is the root Bubbletea model.
 type App struct {
@@ -56,9 +74,14 @@ type App struct {
 	menuIdx int
 
 	// data
-	images   []dockerclient.Image
-	volumes  []dockerclient.Volume
-	tarFiles []tarFile
+	images     []dockerclient.Image
+	volumes    []dockerclient.Volume
+	containers []dockerclient.Container
+	tarFiles   []tarFile
+
+	// images referenced by running containers, keyed by image ID; used to warn
+	// before an image is deleted out from under a live container.
+	runningImageIDs map[string]struct{}
 
 	// sub-models
 	multiSelect MultiSelectModel
@@ -66,21 +89,43 @@ type App struct {
 	inputBuffer string
 
 	// operation state
-	selectedImageIndices   []int
-	selectedVolumeIndices  []int
-	selectedTarFileIndices []int
-	importFilePath         string
-	results                []string
-	composeWarnings        []string
-	errMsg                 string
-	loadingMsg             string
-	exportProgress         exportProgressState
-	exportProgressCh       <-chan operations.ExportProgress
-	importProgress         importProgressState
-	importProgressCh       <-chan operations.ImportProgress
+	selectedImageIndices     []int
+	selectedVolumeIndices    []int
+	selectedContainerIndices []int
+	selectedTarFileIndices   []int
+	importFilePath           string
+	results                  []string
+	composeWarnings          []string
+	errMsg                   string
+	loadingMsg               string
+	exportProgress           exportProgressState
+	exportProgressCh         <-chan operations.ExportProgress
+	importProgress           importProgressState
+	importProgressCh         <-chan operations.ImportProgress
+	removeProgress           removeProgressState
+	removeProgressCh         <-chan operations.RemoveProgress
+
+	// export bundle state
+	pendingDestDir string
+	exportAppend   bool
+	bundleStatus   operations.BundleStatus
+	exportModeIdx  int
+
+	// confirmation state for destructive batch operations
+	confirm confirmState
 
 	windowWidth  int
 	windowHeight int
+}
+
+// confirmState describes a destructive batch operation awaiting confirmation.
+type confirmState struct {
+	title      string
+	rows       [][2]string // label / value pairs shown as an impact summary
+	warnings   []string
+	allowForce bool
+	force      bool
+	forceLabel string
 }
 
 type imageListLoadedMsg struct {
@@ -89,11 +134,23 @@ type imageListLoadedMsg struct {
 	sourceAction action
 	title        string
 	preselect    []int
+	badges       map[int]string
+	runningIDs   map[string]struct{}
 }
 
 type volumeListLoadedMsg struct {
-	volumes []dockerclient.Volume
-	err     error
+	volumes      []dockerclient.Volume
+	err          error
+	sourceAction action
+	title        string
+	badges       map[int]string
+}
+
+type containerListLoadedMsg struct {
+	containers []dockerclient.Container
+	err        error
+	preselect  []int
+	badges     map[int]string
 }
 
 type exportProgressState struct {
@@ -125,26 +182,44 @@ type importProgressMsg struct {
 
 type importSpinnerTickMsg struct{}
 
-var menuItems = []string{
-	"Export Images",
-	"Export Running Container Images",
-	"Export Images from Compose File",
-	"Export Volumes",
-	"Export Volumes from Compose File",
-	"Import Images",
-	"Import Volumes",
-	"Quit",
+type removeProgressState struct {
+	title     string
+	current   string
+	completed int
+	total     int
+	lines     []string
+	spinner   int
 }
 
-var menuIcons = []string{
-	"📦", // Export Images
-	"▶", // Export Running Container Images
-	"🧩", // Export Images from Compose File
-	"🗄", // Export Volumes
-	"🗃", // Export Volumes from Compose File
-	"📥", // Import Images
-	"📥", // Import Volumes
-	"🚪", // Quit
+type removeProgressMsg struct {
+	progress operations.RemoveProgress
+}
+
+type removeSpinnerTickMsg struct{}
+
+// menuItem is one row of the main menu. An item carries the section header it
+// starts (empty for the items that follow it) or a divider, so the menu can
+// grow without hard-coded index ranges in the view.
+type menuItem struct {
+	icon    string
+	label   string
+	section string
+	divider bool
+}
+
+// menuItems order is significant: activateMenuItem switches on the index.
+var menuItems = []menuItem{
+	{icon: "📦", label: "Export Images", section: "EXPORT"},
+	{icon: "▶", label: "Export Running Container Images"},
+	{icon: "🧩", label: "Export Images from Compose File"},
+	{icon: "🗄", label: "Export Volumes"},
+	{icon: "🗃", label: "Export Volumes from Compose File"},
+	{icon: "📥", label: "Import Images", section: "IMPORT"},
+	{icon: "📥", label: "Import Volumes"},
+	{icon: "🗑", label: "Remove Images", section: "CLEANUP"},
+	{icon: "🗄", label: "Remove Volumes"},
+	{icon: "🧹", label: "Remove Containers"},
+	{icon: "🚪", label: "Quit", divider: true},
 }
 
 // NewApp creates and initialises the App model.
@@ -168,6 +243,15 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case volumeListLoadedMsg:
 		return a.handleVolumeListLoaded(msg)
+
+	case containerListLoadedMsg:
+		return a.handleContainerListLoaded(msg)
+
+	case removeProgressMsg:
+		return a.handleRemoveProgress(msg)
+
+	case removeSpinnerTickMsg:
+		return a.handleRemoveSpinnerTick()
 
 	case exportProgressMsg:
 		return a.handleExportProgress(msg)
@@ -198,11 +282,19 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if msg.String() == "ctrl+c" {
 			return a, tea.Quit
 		}
-	case screenImageList, screenVolumeList:
+	case screenImageList, screenVolumeList, screenContainerList:
 		return a.handleList(msg)
 	case screenExportDest:
 		return a.handleExportDest(msg)
+	case screenExportMode:
+		return a.handleExportMode(msg)
 	case screenExportProgress:
+		if msg.String() == "ctrl+c" {
+			return a, tea.Quit
+		}
+	case screenConfirm:
+		return a.handleConfirm(msg)
+	case screenRemoveProgress:
 		if msg.String() == "ctrl+c" {
 			return a, tea.Quit
 		}
@@ -288,7 +380,25 @@ func (a *App) activateMenuItem() (tea.Model, tea.Cmd) {
 		a.action = actionImportVolumes
 		a.screen = screenImportFile
 
-	case 7: // Quit
+	case 7: // Remove Images
+		a.action = actionRemoveImages
+		a.loadingMsg = "Loading Docker images..."
+		a.screen = screenLoading
+		return a, loadImagesForRemovalCmd(a.dc)
+
+	case 8: // Remove Volumes
+		a.action = actionRemoveVolumes
+		a.loadingMsg = "Loading Docker volumes..."
+		a.screen = screenLoading
+		return a, loadVolumesForRemovalCmd(a.dc)
+
+	case 9: // Remove Containers
+		a.action = actionRemoveContainers
+		a.loadingMsg = "Loading Docker containers..."
+		a.screen = screenLoading
+		return a, loadContainersForRemovalCmd(a.dc)
+
+	case 10: // Quit
 		return a, tea.Quit
 	}
 	return a, nil
@@ -353,7 +463,101 @@ func loadRunningContainerImagesCmd(dc *dockerclient.Client) tea.Cmd {
 func loadVolumesCmd(dc *dockerclient.Client) tea.Cmd {
 	return func() tea.Msg {
 		vols, err := dc.ListVolumes(context.Background())
-		return volumeListLoadedMsg{volumes: vols, err: err}
+		return volumeListLoadedMsg{
+			volumes:      vols,
+			err:          err,
+			sourceAction: actionExportVolumes,
+			title:        "Select Volumes to Export",
+		}
+	}
+}
+
+// loadImagesForRemovalCmd lists every image and pre-selects the dangling
+// (untagged) ones, the usual reclaim targets, while flagging images that a
+// running container still holds.
+func loadImagesForRemovalCmd(dc *dockerclient.Client) tea.Cmd {
+	return func() tea.Msg {
+		ctx := context.Background()
+		imgs, err := dc.ListImages(ctx)
+		if err != nil {
+			return imageListLoadedMsg{err: err, sourceAction: actionRemoveImages}
+		}
+
+		// Losing this only costs the "in use" hints, so a failure is not fatal.
+		runningIDs := map[string]struct{}{}
+		if running, err := dc.ListRunningContainerImages(ctx); err == nil {
+			for _, img := range running {
+				runningIDs[img.ID] = struct{}{}
+			}
+		}
+
+		badges := make(map[int]string, len(imgs))
+		var preselect []int
+		for i, img := range imgs {
+			var marks []string
+			if img.Dangling() {
+				marks = append(marks, "⚠ dangling")
+				preselect = append(preselect, i)
+			}
+			if _, ok := runningIDs[img.ID]; ok {
+				marks = append(marks, "● in use")
+			}
+			badges[i] = strings.Join(marks, "  ")
+		}
+
+		return imageListLoadedMsg{
+			images:       imgs,
+			sourceAction: actionRemoveImages,
+			title:        "Select Images to Remove (dangling pre-selected)",
+			preselect:    preselect,
+			badges:       badges,
+			runningIDs:   runningIDs,
+		}
+	}
+}
+
+// loadVolumesForRemovalCmd lists volumes and flags the ones a container still
+// references, which Docker refuses to delete.
+func loadVolumesForRemovalCmd(dc *dockerclient.Client) tea.Cmd {
+	return func() tea.Msg {
+		vols, err := dc.ListVolumes(context.Background())
+		if err != nil {
+			return volumeListLoadedMsg{err: err, sourceAction: actionRemoveVolumes}
+		}
+		badges := make(map[int]string, len(vols))
+		for i, vol := range vols {
+			if vol.RefCount > 0 {
+				badges[i] = fmt.Sprintf("● in use by %d container(s)", vol.RefCount)
+			}
+		}
+		return volumeListLoadedMsg{
+			volumes:      vols,
+			sourceAction: actionRemoveVolumes,
+			title:        "Select Volumes to Remove",
+			badges:       badges,
+		}
+	}
+}
+
+// loadContainersForRemovalCmd lists containers (stopped ones first) and
+// pre-selects everything that is not running.
+func loadContainersForRemovalCmd(dc *dockerclient.Client) tea.Cmd {
+	return func() tea.Msg {
+		containers, err := dc.ListContainers(context.Background(), true)
+		if err != nil {
+			return containerListLoadedMsg{err: err}
+		}
+		badges := make(map[int]string, len(containers))
+		var preselect []int
+		for i, ctr := range containers {
+			if ctr.IsRunning() {
+				badges[i] = "● running"
+				continue
+			}
+			badges[i] = "○ stopped"
+			preselect = append(preselect, i)
+		}
+		return containerListLoadedMsg{containers: containers, preselect: preselect, badges: badges}
 	}
 }
 
@@ -367,6 +571,7 @@ func (a *App) handleImageListLoaded(msg imageListLoadedMsg) (tea.Model, tea.Cmd)
 		return a, nil
 	}
 	a.images = msg.images
+	a.runningImageIDs = msg.runningIDs
 	preselected := make(map[int]struct{}, len(msg.preselect))
 	for _, idx := range msg.preselect {
 		preselected[idx] = struct{}{}
@@ -374,7 +579,9 @@ func (a *App) handleImageListLoaded(msg imageListLoadedMsg) (tea.Model, tea.Cmd)
 	items := make([]SelectableItem, len(msg.images))
 	for i, img := range msg.images {
 		item := imageItem{img: img}
-		if _, ok := preselected[i]; ok {
+		if msg.badges != nil {
+			item.badge = msg.badges[i]
+		} else if _, ok := preselected[i]; ok {
 			item.badge = "● running"
 		}
 		items[i] = item
@@ -389,7 +596,7 @@ func (a *App) handleImageListLoaded(msg imageListLoadedMsg) (tea.Model, tea.Cmd)
 }
 
 func (a *App) handleVolumeListLoaded(msg volumeListLoadedMsg) (tea.Model, tea.Cmd) {
-	if a.screen != screenLoading || a.action != actionExportVolumes {
+	if a.screen != screenLoading || a.action != msg.sourceAction {
 		return a, nil
 	}
 	if msg.err != nil {
@@ -400,11 +607,41 @@ func (a *App) handleVolumeListLoaded(msg volumeListLoadedMsg) (tea.Model, tea.Cm
 	a.volumes = msg.volumes
 	items := make([]SelectableItem, len(msg.volumes))
 	for i, v := range msg.volumes {
-		items[i] = volumeItem{v}
+		item := volumeItem{vol: v}
+		if msg.badges != nil {
+			item.badge = msg.badges[i]
+		}
+		items[i] = item
 	}
-	a.multiSelect = NewMultiSelect("Select Volumes to Export", items, listHeight(a.windowHeight))
-	a.action = actionExportVolumes
+	a.multiSelect = NewMultiSelect(msg.title, items, listHeight(a.windowHeight))
+	a.action = msg.sourceAction
 	a.screen = screenVolumeList
+	return a, nil
+}
+
+func (a *App) handleContainerListLoaded(msg containerListLoadedMsg) (tea.Model, tea.Cmd) {
+	if a.screen != screenLoading || a.action != actionRemoveContainers {
+		return a, nil
+	}
+	if msg.err != nil {
+		a.errMsg = msg.err.Error()
+		a.screen = screenError
+		return a, nil
+	}
+	a.containers = msg.containers
+	items := make([]SelectableItem, len(msg.containers))
+	for i, ctr := range msg.containers {
+		item := containerItem{ctr: ctr}
+		if msg.badges != nil {
+			item.badge = msg.badges[i]
+		}
+		items[i] = item
+	}
+	a.multiSelect = NewMultiSelect("Select Containers to Remove (stopped pre-selected)", items, listHeight(a.windowHeight))
+	if len(msg.preselect) > 0 {
+		a.multiSelect = a.multiSelect.Select(msg.preselect...)
+	}
+	a.screen = screenContainerList
 	return a, nil
 }
 
@@ -427,9 +664,19 @@ func (a *App) handleList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		sort.Ints(indices)
 
-		if a.action == actionExportImages || a.action == actionExportRunningContainerImages || a.action == actionExportComposeImages {
+		switch {
+		case a.action.isImageExport():
 			a.selectedImageIndices = indices
-		} else {
+		case a.action == actionRemoveImages:
+			a.selectedImageIndices = indices
+			return a.confirmRemoveImages()
+		case a.action == actionRemoveVolumes:
+			a.selectedVolumeIndices = indices
+			return a.confirmRemoveVolumes()
+		case a.action == actionRemoveContainers:
+			a.selectedContainerIndices = indices
+			return a.confirmRemoveContainers()
+		default:
 			a.selectedVolumeIndices = indices
 		}
 		a.inputBuffer = ""
@@ -455,6 +702,16 @@ func (a *App) handleExportDest(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.screen = screenError
 			return a, nil
 		}
+		a.pendingDestDir = destDir
+		// An existing bundle is grown rather than silently overwritten, but the
+		// choice is always explicit so a clean re-export stays possible.
+		if status := operations.InspectBundle(destDir); status.Exists() {
+			a.bundleStatus = status
+			a.exportModeIdx = 0
+			a.screen = screenExportMode
+			return a, nil
+		}
+		a.exportAppend = false
 		return a.startExport(destDir)
 	case "esc":
 		a.screen = screenMenu
@@ -471,6 +728,27 @@ func (a *App) handleExportDest(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else if msg.Type == tea.KeyRunes {
 			a.inputBuffer += string(msg.Runes)
 		}
+	}
+	return a, nil
+}
+
+// handleExportMode picks between growing an existing export bundle and
+// rebuilding its import scripts from this selection alone.
+func (a *App) handleExportMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "up", "k":
+		if a.exportModeIdx > 0 {
+			a.exportModeIdx--
+		}
+	case "down", "j":
+		if a.exportModeIdx < 1 {
+			a.exportModeIdx++
+		}
+	case "enter":
+		a.exportAppend = a.exportModeIdx == 0
+		return a.startExport(a.pendingDestDir)
+	case "esc":
+		a.screen = screenExportDest
 	}
 	return a, nil
 }
@@ -494,7 +772,8 @@ func (a *App) startExport(destDir string) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	if a.action == actionExportImages || a.action == actionExportRunningContainerImages || a.action == actionExportComposeImages {
+	appendMode := a.exportAppend
+	if a.action.isImageExport() {
 		ids := make([]string, len(a.selectedImageIndices))
 		names := make([]string, len(a.selectedImageIndices))
 		for i, idx := range a.selectedImageIndices {
@@ -503,6 +782,10 @@ func (a *App) startExport(destDir string) (tea.Model, tea.Cmd) {
 		}
 		go func() {
 			defer close(progressCh)
+			if appendMode {
+				operations.ExportImagesAppendWithProgress(context.Background(), a.dc, ids, names, destDir, callback)
+				return
+			}
 			operations.ExportImagesWithProgress(context.Background(), a.dc, ids, names, destDir, callback)
 		}()
 	} else {
@@ -512,6 +795,10 @@ func (a *App) startExport(destDir string) (tea.Model, tea.Cmd) {
 		}
 		go func() {
 			defer close(progressCh)
+			if appendMode {
+				operations.ExportVolumesAppendWithProgress(context.Background(), a.dc, names, destDir, callback)
+				return
+			}
 			operations.ExportVolumesWithProgress(context.Background(), a.dc, names, destDir, callback)
 		}()
 	}
@@ -673,7 +960,7 @@ func (a *App) loadComposeVolumes(path string) (tea.Model, tea.Cmd) {
 	a.volumes = matched
 	items := make([]SelectableItem, len(matched))
 	for i, v := range matched {
-		items[i] = volumeItem{v}
+		items[i] = volumeItem{vol: v}
 	}
 	a.multiSelect = NewMultiSelect("Select Compose Volumes to Export", items, listHeight(a.windowHeight)).SelectAll()
 	a.screen = screenVolumeList
@@ -824,6 +1111,261 @@ func (a *App) handleImportSpinnerTick() (tea.Model, tea.Cmd) {
 	return a, importSpinnerTickCmd()
 }
 
+// ---- Destructive batch operations ----
+
+func (a *App) confirmRemoveImages() (tea.Model, tea.Cmd) {
+	var totalSize int64
+	dangling, running, multiTag := 0, 0, 0
+	for _, idx := range a.selectedImageIndices {
+		img := a.images[idx]
+		totalSize += img.Size
+		if img.Dangling() {
+			dangling++
+		}
+		if img.TagCount() > 1 {
+			multiTag++
+		}
+		if _, ok := a.runningImageIDs[img.ID]; ok {
+			running++
+		}
+	}
+
+	rows := [][2]string{
+		{"Items", fmt.Sprintf("%d image(s)", len(a.selectedImageIndices))},
+		{"Reclaimable", units.HumanSize(float64(totalSize))},
+	}
+	if dangling > 0 {
+		rows = append(rows, [2]string{"Dangling", fmt.Sprintf("%d", dangling)})
+	}
+	if running > 0 {
+		rows = append(rows, [2]string{"In use", fmt.Sprintf("%d", running)})
+	}
+	if multiTag > 0 {
+		rows = append(rows, [2]string{"Multi-tag", fmt.Sprintf("%d", multiTag)})
+	}
+
+	var warnings []string
+	if running > 0 {
+		warnings = append(warnings, fmt.Sprintf("%d image(s) are held by running containers; remove or stop those containers first, or they will fail.", running))
+	}
+	if multiTag > 0 {
+		warnings = append(warnings, fmt.Sprintf("%d image(s) carry several tags; deleting them drops every tag.", multiTag))
+	}
+	if dangling > 0 {
+		warnings = append(warnings, fmt.Sprintf("%d dangling image(s) are untagged build cache; removing them only costs rebuild time.", dangling))
+	}
+
+	a.confirm = confirmState{
+		title:      "Delete Docker Images",
+		rows:       rows,
+		warnings:   warnings,
+		allowForce: true,
+		forceLabel: "also remove images referenced by stopped containers",
+	}
+	a.screen = screenConfirm
+	return a, nil
+}
+
+func (a *App) confirmRemoveVolumes() (tea.Model, tea.Cmd) {
+	var totalSize int64
+	unknownSize, inUse := 0, 0
+	for _, idx := range a.selectedVolumeIndices {
+		vol := a.volumes[idx]
+		if vol.Size >= 0 {
+			totalSize += vol.Size
+		} else {
+			unknownSize++
+		}
+		if vol.RefCount > 0 {
+			inUse++
+		}
+	}
+
+	size := units.HumanSize(float64(totalSize))
+	if unknownSize > 0 {
+		size += fmt.Sprintf(" (+%d unknown)", unknownSize)
+	}
+	rows := [][2]string{
+		{"Items", fmt.Sprintf("%d volume(s)", len(a.selectedVolumeIndices))},
+		{"Size", size},
+	}
+	if inUse > 0 {
+		rows = append(rows, [2]string{"In use", fmt.Sprintf("%d", inUse)})
+	}
+
+	warnings := []string{
+		"Volume data is deleted permanently. Docker refuses to remove a volume still referenced by a container.",
+	}
+	if inUse > 0 {
+		warnings = append(warnings, fmt.Sprintf("%d selected volume(s) are referenced by containers and will fail.", inUse))
+	}
+
+	a.confirm = confirmState{title: "Delete Docker Volumes", rows: rows, warnings: warnings}
+	a.screen = screenConfirm
+	return a, nil
+}
+
+func (a *App) confirmRemoveContainers() (tea.Model, tea.Cmd) {
+	running := 0
+	for _, idx := range a.selectedContainerIndices {
+		if a.containers[idx].IsRunning() {
+			running++
+		}
+	}
+
+	rows := [][2]string{
+		{"Items", fmt.Sprintf("%d container(s)", len(a.selectedContainerIndices))},
+		{"Running", fmt.Sprintf("%d", running)},
+	}
+	warnings := []string{
+		"Anonymous volumes attached to these containers are left behind, not deleted.",
+	}
+	if running > 0 {
+		warnings = append(warnings, fmt.Sprintf("%d running container(s) must be stopped first, unless force is enabled.", running))
+	}
+
+	a.confirm = confirmState{
+		title:      "Remove Docker Containers",
+		rows:       rows,
+		warnings:   warnings,
+		allowForce: true,
+		forceLabel: "stop running containers first, then remove them",
+	}
+	a.screen = screenConfirm
+	return a, nil
+}
+
+func (a *App) handleConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "f":
+		if a.confirm.allowForce {
+			a.confirm.force = !a.confirm.force
+		}
+	case "enter":
+		return a.startRemove()
+	case "esc":
+		a.screen = screenMenu
+	}
+	return a, nil
+}
+
+func (a *App) startRemove() (tea.Model, tea.Cmd) {
+	progressCh := make(chan operations.RemoveProgress)
+	a.removeProgressCh = progressCh
+	a.removeProgress = removeProgressState{title: removeProgressTitle(a.action)}
+	a.screen = screenRemoveProgress
+	force := a.confirm.force
+
+	emit := func(progress operations.RemoveProgress) { progressCh <- progress }
+
+	switch a.action {
+	case actionRemoveImages:
+		ids := make([]string, len(a.selectedImageIndices))
+		names := make([]string, len(a.selectedImageIndices))
+		for i, idx := range a.selectedImageIndices {
+			ids[i] = a.images[idx].ID
+			names[i] = a.images[idx].DisplayName()
+		}
+		go func() {
+			defer close(progressCh)
+			operations.RemoveImagesWithProgress(context.Background(), a.dc, ids, names, force, emit)
+		}()
+
+	case actionRemoveVolumes:
+		names := make([]string, len(a.selectedVolumeIndices))
+		for i, idx := range a.selectedVolumeIndices {
+			names[i] = a.volumes[idx].Name
+		}
+		go func() {
+			defer close(progressCh)
+			operations.RemoveVolumesWithProgress(context.Background(), a.dc, names, emit)
+		}()
+
+	case actionRemoveContainers:
+		ids := make([]string, len(a.selectedContainerIndices))
+		names := make([]string, len(a.selectedContainerIndices))
+		for i, idx := range a.selectedContainerIndices {
+			ids[i] = a.containers[idx].ID
+			names[i] = a.containers[idx].Name
+		}
+		go func() {
+			defer close(progressCh)
+			operations.RemoveContainersWithProgress(context.Background(), a.dc, ids, names, force, emit)
+		}()
+	}
+
+	return a, tea.Batch(waitRemoveProgressCmd(progressCh), removeSpinnerTickCmd())
+}
+
+func removeProgressTitle(a action) string {
+	switch a {
+	case actionRemoveImages:
+		return "Removing Images"
+	case actionRemoveVolumes:
+		return "Removing Volumes"
+	default:
+		return "Removing Containers"
+	}
+}
+
+func waitRemoveProgressCmd(progressCh <-chan operations.RemoveProgress) tea.Cmd {
+	return func() tea.Msg {
+		progress, ok := <-progressCh
+		if !ok {
+			return removeProgressMsg{progress: operations.RemoveProgress{Done: true}}
+		}
+		return removeProgressMsg{progress: progress}
+	}
+}
+
+func (a *App) handleRemoveProgress(msg removeProgressMsg) (tea.Model, tea.Cmd) {
+	if a.screen != screenRemoveProgress {
+		return a, nil
+	}
+
+	progress := msg.progress
+	if progress.Total > 0 {
+		a.removeProgress.total = progress.Total
+	}
+	if progress.Name != "" {
+		a.removeProgress.current = progress.Name
+	}
+	if progress.Index >= 0 {
+		a.removeProgress.completed = progress.Index
+	}
+	if progress.HasResult {
+		if progress.Result.Err != nil {
+			a.removeProgress.lines = append(a.removeProgress.lines, styleError.Render("✗ "+progress.Result.Name+": "+progress.Result.Err.Error()))
+		} else {
+			a.removeProgress.lines = append(a.removeProgress.lines, styleSuccess.Render("✔ Removed: "+progress.Result.Name))
+		}
+	}
+	if progress.Done {
+		a.results = a.removeProgress.lines
+		if len(a.results) == 0 {
+			a.results = []string{styleMuted.Render("Nothing matched the selection.")}
+		}
+		a.screen = screenResults
+		return a, nil
+	}
+
+	return a, waitRemoveProgressCmd(a.removeProgressCh)
+}
+
+func removeSpinnerTickCmd() tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg {
+		return removeSpinnerTickMsg{}
+	})
+}
+
+func (a *App) handleRemoveSpinnerTick() (tea.Model, tea.Cmd) {
+	if a.screen != screenRemoveProgress {
+		return a, nil
+	}
+	a.removeProgress.spinner++
+	return a, removeSpinnerTickCmd()
+}
+
 // ---- Volume name input for import ----
 
 func (a *App) handleImportVolumeName(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -870,19 +1412,18 @@ func (a *App) View() string {
 
 	switch a.screen {
 	case screenMenu:
-		// Export group
-		sb.WriteString(styleSectionLabel.Render("  EXPORT") + "\n")
-		for i := 0; i <= 4; i++ {
-			renderMenuItem(&sb, i, menuIcons[i]+"  "+menuItems[i], a.menuIdx)
+		for i, item := range menuItems {
+			switch {
+			case item.section != "":
+				if i > 0 {
+					sb.WriteString("\n")
+				}
+				sb.WriteString(styleSectionLabel.Render("  "+item.section) + "\n")
+			case item.divider:
+				sb.WriteString("\n" + styleDivider.Render("  "+strings.Repeat("─", 32)) + "\n")
+			}
+			renderMenuItem(&sb, i, item.icon+"  "+item.label, a.menuIdx)
 		}
-		sb.WriteString("\n")
-		// Import group
-		sb.WriteString(styleSectionLabel.Render("  IMPORT") + "\n")
-		for i := 5; i <= 6; i++ {
-			renderMenuItem(&sb, i, menuIcons[i]+"  "+menuItems[i], a.menuIdx)
-		}
-		sb.WriteString("\n" + styleDivider.Render("  "+strings.Repeat("─", 32)) + "\n")
-		renderMenuItem(&sb, 7, menuIcons[7]+"  "+menuItems[7], a.menuIdx)
 		sb.WriteString(renderHelpBar("↑↓", "navigate", "enter", "select", "q", "quit"))
 
 	case screenLoading:
@@ -890,7 +1431,7 @@ func (a *App) View() string {
 		sb.WriteString("  " + styleMuted.Render("⣷") + "  " + styleNormal.Render(a.loadingMsg) + "\n")
 		sb.WriteString(renderHelpBar("esc", "cancel"))
 
-	case screenImageList, screenVolumeList:
+	case screenImageList, screenVolumeList, screenContainerList:
 		sb.WriteString(a.multiSelect.View())
 
 	case screenExportDest:
@@ -899,6 +1440,56 @@ func (a *App) View() string {
 		sb.WriteString(styleMuted.Render("  leave blank to use: "+defaultFilePickerDir()) + "\n\n")
 		sb.WriteString(styleMuted.Render("  ▸ ") + styleInput.Render(a.inputBuffer) + styleMenuCursor.Render("▌") + "\n")
 		sb.WriteString(renderHelpBar("enter", "confirm", "ctrl+u", "clear", "esc", "cancel"))
+
+	case screenExportMode:
+		sb.WriteString(styleTitle.Render("Existing Export Found") + "\n\n")
+		sb.WriteString(styleNormal.Render("  "+a.pendingDestDir) + "\n")
+		sb.WriteString(styleMuted.Render(fmt.Sprintf("  already holds %d image(s) and %d volume(s)",
+			a.bundleStatus.Images, a.bundleStatus.Volumes)) + "\n\n")
+
+		options := []struct {
+			label string
+			desc  string
+		}{
+			{"＋  Append", "keep the existing bundle and add this selection to its import scripts"},
+			{"⟳  Overwrite", "rebuild the import scripts from this selection only (old tar files stay on disk)"},
+		}
+		for i, option := range options {
+			if i == a.exportModeIdx {
+				sb.WriteString(styleMenuCursor.Render("  ▸ ") + styleMenuItemActive.Render(option.label) + "\n")
+			} else {
+				sb.WriteString("    " + styleMenuItem.Render(option.label) + "\n")
+			}
+			sb.WriteString(styleMuted.Render("      "+option.desc) + "\n")
+		}
+		sb.WriteString(renderHelpBar("↑↓", "choose", "enter", "confirm", "esc", "back"))
+
+	case screenConfirm:
+		sb.WriteString(styleError.Render("  ⚠  "+a.confirm.title) + "\n\n")
+		for _, row := range a.confirm.rows {
+			sb.WriteString("  " + styleMuted.Render(padRight(row[0], 14)) + styleNormal.Render(row[1]) + "\n")
+		}
+		if len(a.confirm.warnings) > 0 {
+			sb.WriteString("\n")
+			for _, warning := range a.confirm.warnings {
+				sb.WriteString("  " + styleInfo.Render("▲ "+warning) + "\n")
+			}
+		}
+		if a.confirm.allowForce {
+			sb.WriteString("\n  ")
+			if a.confirm.force {
+				sb.WriteString(styleError.Render("Force [ on ]"))
+			} else {
+				sb.WriteString(styleMuted.Render("Force [ off ]"))
+			}
+			sb.WriteString(styleMuted.Render("  "+a.confirm.forceLabel) + "\n")
+		}
+		help := []string{"enter", "confirm"}
+		if a.confirm.allowForce {
+			help = append(help, "f", "toggle force")
+		}
+		help = append(help, "esc", "cancel")
+		sb.WriteString(renderHelpBar(help...))
 
 	case screenExportProgress:
 		sb.WriteString(styleTitle.Render("Exporting") + "\n\n")
@@ -975,6 +1566,31 @@ func (a *App) View() string {
 	case screenComposeFile:
 		sb.WriteString(a.filePicker.View())
 
+	case screenRemoveProgress:
+		sb.WriteString(styleTitle.Render(a.removeProgress.title) + "\n\n")
+		total := a.removeProgress.total
+		completed := a.removeProgress.completed
+		if total == 0 {
+			total = 1
+		}
+		sb.WriteString(styleNormal.Render(fmt.Sprintf("  %s  %d / %d complete",
+			styleCursor.Render(spinnerFrame(a.removeProgress.spinner)), completed, total)) + "\n")
+		sb.WriteString("  " + renderProgressBar(completed, total, 32) + "\n")
+		if a.removeProgress.current != "" && completed < total {
+			sb.WriteString(styleMuted.Render("  Working  ") + styleNormal.Render(a.removeProgress.current) + "\n")
+		}
+		if len(a.removeProgress.lines) > 0 {
+			sb.WriteString("\n")
+			start := len(a.removeProgress.lines) - 6
+			if start < 0 {
+				start = 0
+			}
+			for _, line := range a.removeProgress.lines[start:] {
+				sb.WriteString("  " + line + "\n")
+			}
+		}
+		sb.WriteString(renderHelpBar("ctrl+c", "quit"))
+
 	case screenResults:
 		sb.WriteString(styleTitle.Render("Results") + "\n\n")
 		// Summary counts
@@ -1022,6 +1638,15 @@ func renderMenuItem(sb *strings.Builder, idx int, item string, activeIdx int) {
 	}
 }
 
+// padRight pads s with spaces so values line up, guaranteeing one separator
+// space even when the label is already the target width or wider.
+func padRight(s string, width int) string {
+	if n := len([]rune(s)); n < width {
+		return s + strings.Repeat(" ", width-n)
+	}
+	return s + " "
+}
+
 // renderHelpBar renders a key-description help footer.
 // Pairs are alternating: key, description, key, description, ...
 func renderHelpBar(pairs ...string) string {
@@ -1050,7 +1675,10 @@ func (i imageItem) SubText() string {
 	return s
 }
 
-type volumeItem struct{ vol dockerclient.Volume }
+type volumeItem struct {
+	vol   dockerclient.Volume
+	badge string
+}
 
 func (v volumeItem) DisplayName() string { return v.vol.Name }
 func (v volumeItem) SubText() string {
@@ -1062,7 +1690,25 @@ func (v volumeItem) SubText() string {
 	if v.vol.RefCount >= 0 {
 		refCount = fmt.Sprintf("%d", v.vol.RefCount)
 	}
-	return fmt.Sprintf("Driver: %s  Size: %s  Ref: %s  Mount: %s", v.vol.Driver, size, refCount, v.vol.Mountpoint)
+	line := fmt.Sprintf("Driver: %s  Size: %s  Ref: %s  Mount: %s", v.vol.Driver, size, refCount, v.vol.Mountpoint)
+	if v.badge != "" {
+		return v.badge + "  " + line
+	}
+	return line
+}
+
+type containerItem struct {
+	ctr   dockerclient.Container
+	badge string
+}
+
+func (c containerItem) DisplayName() string { return c.ctr.Name }
+func (c containerItem) SubText() string {
+	line := fmt.Sprintf("ID: %s  Image: %s  %s", c.ctr.ShortID, c.ctr.Image, c.ctr.Status)
+	if c.badge != "" {
+		return c.badge + "  " + line
+	}
+	return line
 }
 
 type tarFile struct {

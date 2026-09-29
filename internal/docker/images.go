@@ -17,6 +17,7 @@ type Image struct {
 	ShortID    string
 	Repository string
 	Tag        string
+	RepoTags   []string
 	Size       int64
 	Created    int64
 }
@@ -30,6 +31,24 @@ func (i Image) DisplayName() string {
 		return i.Repository
 	}
 	return fmt.Sprintf("%s:%s", i.Repository, i.Tag)
+}
+
+// Dangling reports whether no repository tag points at the image, i.e. every
+// tag was removed and it only survives as a build cache entry.
+func (i Image) Dangling() bool {
+	return i.Repository == "<none>" || i.Repository == ""
+}
+
+// TagCount returns how many repository tags reference the image. Removing an
+// image by ID removes all of them.
+func (i Image) TagCount() int {
+	if len(i.RepoTags) > 0 {
+		return len(i.RepoTags)
+	}
+	if i.Dangling() {
+		return 0
+	}
+	return 1
 }
 
 // ListImages returns all local Docker images.
@@ -47,6 +66,7 @@ func (c *Client) ListImages(ctx context.Context) ([]Image, error) {
 			ShortID:    shortID(s.ID),
 			Repository: repo,
 			Tag:        tag,
+			RepoTags:   s.RepoTags,
 			Size:       s.Size,
 			Created:    s.Created,
 		})
